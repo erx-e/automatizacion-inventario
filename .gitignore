@@ -1,0 +1,14 @@
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+
+# Secretos locales
+golden-sambo-inventario-*.json
+google-service-account.json
+# Artefactos locales del motor
+cierres-diarios/
