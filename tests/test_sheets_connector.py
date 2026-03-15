@@ -2,6 +2,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -185,6 +186,23 @@ class ParsearRegistroRowsTests(unittest.TestCase):
         self.assertEqual(registros["PAN DE SEMILLA NEGRA"]["ingreso"], 12)
 
 
+class LeerRegistroDiaTests(unittest.TestCase):
+    def test_lee_toda_la_hoja_sin_limitar_a_q(self):
+        ws = types.SimpleNamespace(row_count=200)
+        sh = types.SimpleNamespace(worksheet=lambda hoja_nombre: ws)
+        gc = types.SimpleNamespace(open_by_key=lambda key: sh)
+
+        with mock.patch.object(sheets_connector, "get_client", return_value=gc), mock.patch.object(
+            sheets_connector,
+            "_leer_valores_hoja",
+            return_value=[],
+        ) as leer_mock:
+            sheets_connector.leer_registro_dia("REGISTRO C1", "2026-03-10")
+
+        self.assertEqual(leer_mock.call_args.args, (ws,))
+        self.assertEqual(leer_mock.call_args.kwargs, {})
+
+
 class VentasEsperadasTests(unittest.TestCase):
     def test_congelador_usa_salida_registrada_como_ventas(self):
         consumo_por_hoja = {"C1": {}, "C2": {"CREPE POLLO 2 unid": 0}, "LINEA": {}}
@@ -264,6 +282,37 @@ class VentasNeolaHelpersTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "HAMBURGUESA GOLD / HAMBURGUESA \\(180gr\\)"):
             sheets_connector._validar_bloque_ventas_neola(rows_bloque, ventas, consumo)
+
+    def test_construye_fila_con_hasta_seis_insumos(self):
+        ventas = [
+            {"plato": "TABLA MIXTA", "cantidad": 1, "precio_total": 20.00},
+        ]
+        consumo = [
+            {"plato": "TABLA MIXTA", "insumo": "INSUMO 1", "cantidad_total": 1},
+            {"plato": "TABLA MIXTA", "insumo": "INSUMO 2", "cantidad_total": 2},
+            {"plato": "TABLA MIXTA", "insumo": "INSUMO 3", "cantidad_total": 3},
+            {"plato": "TABLA MIXTA", "insumo": "INSUMO 4", "cantidad_total": 4},
+            {"plato": "TABLA MIXTA", "insumo": "INSUMO 5", "cantidad_total": 5},
+            {"plato": "TABLA MIXTA", "insumo": "INSUMO 6", "cantidad_total": 6},
+        ]
+
+        rows = sheets_connector._construir_filas_ventas_neola("2026-03-13", ventas, consumo)
+
+        self.assertEqual(len(rows[0]), sheets_connector.COLUMNAS_VENTAS_NEOLA)
+        self.assertEqual(rows[1][13], "INSUMO 6")
+        self.assertEqual(rows[1][14], 6)
+
+    def test_falla_si_un_plato_supera_seis_insumos(self):
+        ventas = [
+            {"plato": "TABLA MIXTA", "cantidad": 1, "precio_total": 20.00},
+        ]
+        consumo = [
+            {"plato": "TABLA MIXTA", "insumo": f"INSUMO {idx}", "cantidad_total": idx}
+            for idx in range(1, 8)
+        ]
+
+        with self.assertRaisesRegex(ValueError, "soporta hasta 6 por plato"):
+            sheets_connector._construir_filas_ventas_neola("2026-03-13", ventas, consumo)
 
 
 class InventarioHelpersTests(unittest.TestCase):

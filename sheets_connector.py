@@ -16,6 +16,8 @@ SCOPES = [
 
 _client = None
 VALORES_CONFIRMACION_RECETA = {"✅", "❓"}
+MAX_INSUMOS_POR_PLATO_VENTAS = 6
+COLUMNAS_VENTAS_NEOLA = 3 + (MAX_INSUMOS_POR_PLATO_VENTAS * 2)
 MESES_ES = {
     1: "ENERO",
     2: "FEBRERO",
@@ -270,7 +272,7 @@ def leer_registro_dia(hoja_nombre: str, fecha: str) -> dict:
     gc = get_client()
     sh = gc.open_by_key(SHEET_REGISTROS)
     ws = sh.worksheet(hoja_nombre)
-    rows = _leer_valores_hoja(ws, f"A1:Q{ws.row_count}")
+    rows = _leer_valores_hoja(ws)
     return _parsear_registro_rows(rows, fecha)
 
 
@@ -380,7 +382,7 @@ def _estructura_actual_ventas_neola(rows_bloque: list[list[str]]) -> dict[str, d
 
         cantidad = _parsear_numero(row[1] if len(row) > 1 else "")
         insumos = {}
-        for idx in range(3, 10, 2):
+        for idx in range(3, COLUMNAS_VENTAS_NEOLA, 2):
             if len(row) <= idx:
                 break
             insumo = row[idx].strip()
@@ -431,22 +433,23 @@ def _validar_bloque_ventas_neola(rows_bloque: list[list[str]], ventas: list[dict
 
 
 def _escribir_bloque_ventas_neola(ws, next_row: int, rows_to_write: list[list[str]], filas_a_limpiar: int):
+    ultima_columna = gspread.utils.rowcol_to_a1(1, COLUMNAS_VENTAS_NEOLA).rstrip("1")
     if filas_a_limpiar:
         ws.update(
-            f"A{next_row}:K{next_row + filas_a_limpiar - 1}",
-            [[""] * 11 for _ in range(filas_a_limpiar)],
+            f"A{next_row}:{ultima_columna}{next_row + filas_a_limpiar - 1}",
+            [[""] * COLUMNAS_VENTAS_NEOLA for _ in range(filas_a_limpiar)],
         )
         _esperar_despues_de_write()
 
     if rows_to_write:
-        ws.update(f"A{next_row}:K{next_row + len(rows_to_write) - 1}", rows_to_write)
+        ws.update(f"A{next_row}:{ultima_columna}{next_row + len(rows_to_write) - 1}", rows_to_write)
         _esperar_despues_de_write()
 
 
 def _construir_filas_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]) -> list[list[str]]:
     fecha_display = _fecha_a_display(fecha)
     ventas_agrupadas = _agrupar_ventas_neola(ventas)
-    rows_to_write = [[fecha_display] + [""] * 10]
+    rows_to_write = [[fecha_display] + [""] * (COLUMNAS_VENTAS_NEOLA - 1)]
     consumo_por_plato = _agrupar_consumo_para_neola(consumo)
 
     for venta in ventas_agrupadas:
@@ -454,11 +457,17 @@ def _construir_filas_ventas_neola(fecha: str, ventas: list[dict], consumo: list[
         row = [plato, venta["cantidad"], ""]
 
         insumos_plato = consumo_por_plato.get(plato, [])
-        for ins in insumos_plato[:4]:
+        if len(insumos_plato) > MAX_INSUMOS_POR_PLATO_VENTAS:
+            raise ValueError(
+                f"{plato} tiene {len(insumos_plato)} insumos y VENTAS NEOLA soporta "
+                f"hasta {MAX_INSUMOS_POR_PLATO_VENTAS} por plato."
+            )
+
+        for ins in insumos_plato:
             row.append(ins["insumo"])
             row.append(ins["cantidad_total"])
 
-        rows_to_write.append(row + [""] * (11 - len(row)))
+        rows_to_write.append(row + [""] * (COLUMNAS_VENTAS_NEOLA - len(row)))
 
     return rows_to_write
 
@@ -470,7 +479,10 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
     ventas_agrupadas = _agrupar_ventas_neola(ventas)
     rows_to_write = _construir_filas_ventas_neola(fecha, ventas, consumo)
 
-    all_values = _leer_valores_hoja(ws, f"A1:K{ws.row_count}")
+    all_values = _leer_valores_hoja(
+        ws,
+        f"A1:{gspread.utils.rowcol_to_a1(ws.row_count, COLUMNAS_VENTAS_NEOLA)}",
+    )
     fila_existente = _buscar_fila_fecha_ventas(all_values, fecha)
     next_row = fila_existente or (_ultima_fila_no_vacia(all_values) + 1)
     total_rows = next_row + len(ventas_agrupadas)
@@ -487,14 +499,14 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
                         "startRowIndex": 3,
                         "endRowIndex": 4,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 11,
+                        "endColumnIndex": COLUMNAS_VENTAS_NEOLA,
                     },
                     "destination": {
                         "sheetId": ws.id,
                         "startRowIndex": next_row - 1,
                         "endRowIndex": next_row,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 11,
+                        "endColumnIndex": COLUMNAS_VENTAS_NEOLA,
                     },
                     "pasteType": "PASTE_FORMAT",
                     "pasteOrientation": "NORMAL",
@@ -509,14 +521,14 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
                         "startRowIndex": 4,
                         "endRowIndex": 5,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 11,
+                        "endColumnIndex": COLUMNAS_VENTAS_NEOLA,
                     },
                     "destination": {
                         "sheetId": ws.id,
                         "startRowIndex": target_row - 1,
                         "endRowIndex": target_row,
                         "startColumnIndex": 0,
-                        "endColumnIndex": 11,
+                        "endColumnIndex": COLUMNAS_VENTAS_NEOLA,
                     },
                     "pasteType": "PASTE_FORMAT",
                     "pasteOrientation": "NORMAL",
@@ -530,7 +542,10 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
     ultimo_error = None
     for _ in range(3):
         _escribir_bloque_ventas_neola(ws, next_row, rows_to_write, filas_a_limpiar)
-        bloque_actual = _leer_valores_hoja(ws, f"A{next_row}:K{next_row + len(rows_to_write) - 1}")
+        bloque_actual = _leer_valores_hoja(
+            ws,
+            f"A{next_row}:{gspread.utils.rowcol_to_a1(next_row + len(rows_to_write) - 1, COLUMNAS_VENTAS_NEOLA)}",
+        )
         try:
             _validar_bloque_ventas_neola(bloque_actual, ventas, consumo)
             return
