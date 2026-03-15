@@ -18,7 +18,7 @@
 
 ## Flujo del motor
 1. Parsear la foto con Claude y extraer solo `VENTAS_ALIMENTOS`.
-2. Ignorar postres e items con `$0.00`.
+2. Ignorar postres. Items con `$0.00` **sí se incluyen** — son ventas reales (cortesías, invitaciones) que consumen insumos.
 3. Buscar cada plato en recetas.
 4. Calcular consumo teórico por insumo.
 5. Mostrar preview y pedir confirmación.

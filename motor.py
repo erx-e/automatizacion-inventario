@@ -19,7 +19,7 @@ from sheets_connector import (
     leer_recetas, leer_ubicacion_descuento,
     leer_registros_dia_completo, escribir_ventas_neola,
     escribir_inventario_dia, leer_diferencias_inventario_dia,
-    corregir_inventario_insumos
+    corregir_inventario_insumos, verificar_inventario_dia_existe,
 )
 
 # Zona horaria de Ecuador (UTC-5)
@@ -489,20 +489,15 @@ def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
         lineas.append(f"\n{'=' * 40}")
         if any("Rollitos rellenos ambiguos" in alerta for alerta in resultado["alertas"]):
             lineas.append("❌ No se puede continuar hasta aclarar los rollitos rellenos.")
-            lineas.append("Indica cuántos fueron de pollo y cuántos de queso.")
-            lineas.append("Ejemplo: --rollitos-pollo 1 --rollitos-queso 1")
+            lineas.append("¿Cuántos fueron de pollo y cuántos de queso?")
         elif requiere_receta:
-            lineas.append("❌ No se puede continuar hasta confirmar la receta similar sugerida.")
-            lineas.append("Si confirmas que la receta sugerida corresponde al plato del ticket, actualiza el nombre en recetas y vuelve a correr el cierre.")
+            lineas.append("❌ Hay un plato que no coincide exactamente con las recetas.")
+            lineas.append("Confirma si la receta sugerida es correcta para poder continuar.")
         else:
             lineas.append("❌ No se puede continuar hasta aclarar la información pendiente.")
     else:
-        # Pregunta de confirmación
         lineas.append(f"\n{'=' * 40}")
-        lineas.append(f"¿Todo correcto? Responde:")
-        lineas.append(f"   'si' → proceder con el cierre")
-        lineas.append(f"   'fecha YYYY-MM-DD' → cambiar la fecha")
-        lineas.append(f"   'no' → cancelar")
+        lineas.append("¿Todo correcto? ¿Procedo con el cierre?")
 
     resultado["resumen"] = "\n".join(lineas)
     return resultado
@@ -838,6 +833,168 @@ def _formatear_diferencias_inventario(diferencias: dict) -> list[str]:
 
 
 # ============================================================
+# Opción 2: Inventario solo desde registros (sin ticket)
+# ============================================================
+
+def preparar_inventario_registros(fecha: str = None) -> dict:
+    """
+    Preview de inventario usando solo registros del día. Sin foto de ticket.
+    No escribe nada en Sheets.
+    """
+    if not fecha:
+        fecha = sugerir_fecha()[0]
+
+    try:
+        registros = leer_registros_dia_completo(fecha)
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al leer registros: {str(e)}"}
+
+    total_movimientos = sum(len(r) for r in registros.values())
+    if total_movimientos == 0:
+        return {
+            "ok": False,
+            "resumen": f"❌ No hay registros para el {fecha}. Primero ingresa los registros del día.",
+        }
+
+    try:
+        ubicaciones = leer_ubicacion_descuento()
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al leer ubicaciones: {str(e)}"}
+
+    lineas = [f"📋 INVENTARIO DESDE REGISTROS — {fecha}"]
+    lineas.append("=" * 40)
+
+    for ubicacion_key, hoja_nombre in [("C1", "C1"), ("C2", "C2"), ("LINEA", "LINEA CALIENTE")]:
+        insumos = registros.get(ubicacion_key, {})
+        if not insumos:
+            continue
+        lineas.append(f"\n📦 {hoja_nombre}:")
+        for insumo, datos in insumos.items():
+            partes = []
+            if datos.get("ingreso", 0):
+                partes.append(f"ingreso={datos['ingreso']}")
+            if datos.get("salida", 0):
+                partes.append(f"salida={datos['salida']}")
+            if datos.get("conteo") is not None:
+                partes.append(f"conteo={datos['conteo']}")
+            if datos.get("motivo"):
+                partes.append(f"motivo: {datos['motivo']}")
+            lineas.append(f"   • {insumo}: {', '.join(partes)}")
+
+    lineas.append(f"\n{'=' * 40}")
+    lineas.append(f"Se crearán las entradas del {fecha} en C1, C2 y LINEA CALIENTE.")
+    lineas.append("VENTAS quedará vacío hasta que se procese el ticket.")
+    lineas.append("\n¿Todo correcto? ¿Procedo?")
+
+    return {
+        "ok": True,
+        "fecha": fecha,
+        "registros": registros,
+        "ubicaciones": ubicaciones,
+        "resumen": "\n".join(lineas),
+    }
+
+
+def confirmar_inventario_registros(preparacion: dict) -> str:
+    """Escribe el inventario del día usando solo registros. VENTAS = 0."""
+    fecha = preparacion["fecha"]
+    registros = preparacion["registros"]
+    ubicaciones = preparacion["ubicaciones"]
+
+    try:
+        escribir_inventario_dia(fecha, {}, registros, ubicaciones)
+    except Exception as e:
+        return f"❌ Error al escribir inventario: {str(e)}"
+
+    try:
+        diferencias = leer_diferencias_inventario_dia(fecha)
+    except Exception as e:
+        diferencias = {"C1": [], "C2": [], "LINEA CALIENTE": []}
+
+    lineas = [f"✅ INVENTARIO CREADO — {fecha}"]
+    lineas.append("Entradas creadas en C1, C2 y LINEA CALIENTE.")
+    lineas.append("VENTAS está vacío — procesa el ticket cuando esté listo.")
+    lineas.extend(_formatear_diferencias_inventario(diferencias))
+    return "\n".join(lineas)
+
+
+# ============================================================
+# Opción 1 Camino C: Solo cargar ventas a entrada existente
+# ============================================================
+
+def preparar_solo_ventas(image_path: str = None, image_bytes: bytes = None,
+                         media_type: str = "image/jpeg", fecha: str = None,
+                         rollitos_override: dict | None = None) -> dict:
+    """
+    Preview de ventas para cargar a una entrada de inventario ya existente.
+    Requiere que la entrada del día ya exista (creada con solo-registros).
+    """
+    if not fecha:
+        fecha = sugerir_fecha()[0]
+
+    # Verificar que la entrada del día existe
+    try:
+        existencia = verificar_inventario_dia_existe(fecha)
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al verificar inventario: {str(e)}"}
+
+    hojas_faltantes = [hoja for hoja, existe in existencia.items() if not existe]
+    if hojas_faltantes:
+        return {
+            "ok": False,
+            "resumen": (
+                f"❌ No existe la entrada del {fecha} en: {', '.join(hojas_faltantes)}.\n"
+                "Primero crea la entrada del día con los registros."
+            ),
+        }
+
+    # Preparar cierre normal (parsear ticket + calcular consumo)
+    prep = preparar_cierre(
+        image_path=image_path,
+        image_bytes=image_bytes,
+        media_type=media_type,
+        fecha=fecha,
+        rollitos_override=rollitos_override,
+    )
+    if not prep["ok"]:
+        return prep
+
+    # Reemplazar resumen con uno específico para solo-ventas
+    lineas = [f"📋 CARGAR VENTAS — {fecha}"]
+    lineas.append("=" * 40)
+    lineas.append("La entrada del día ya existe. Solo se actualizarán las VENTAS.")
+
+    total_platos = sum(v["cantidad"] for v in prep["ventas"])
+    recetas = []
+    try:
+        recetas = leer_recetas()
+    except Exception:
+        pass
+
+    lineas.append(f"\n🍽️ Platos e insumos ({total_platos} unidades):")
+    lineas.extend(_formatear_desglose_por_plato(prep["ventas"], prep["consumo"], recetas))
+    lineas.append(_titulo_total_insumos(prep["consumo_agrupado"]))
+    lineas.extend(_formatear_totales_por_insumo(prep["consumo_agrupado"]))
+
+    if prep["alertas"]:
+        lineas.append(f"\n⚠️ Alertas:")
+        for a in prep["alertas"]:
+            lineas.append(f"   {a}")
+
+    lineas.append(f"\n{'=' * 40}")
+    lineas.append("¿Todo correcto? ¿Cargo las ventas?")
+
+    prep["resumen"] = "\n".join(lineas)
+    prep["solo_ventas"] = True
+    return prep
+
+
+def confirmar_solo_ventas(preparacion: dict) -> str:
+    """Carga las ventas del ticket a una entrada de inventario ya existente."""
+    return confirmar_cierre(preparacion)
+
+
+# ============================================================
 # Funciones legacy (para uso directo desde terminal)
 # ============================================================
 
@@ -976,7 +1133,6 @@ def solo_consumo_teorico(image_path: str = None, image_bytes: bytes = None,
 
     if _cantidad_rollitos_ambiguos(ventas):
         lineas.append("\n❓ Tipo de rollitos vendidos por confirmar.")
-        lineas.append("Indica cuántos fueron de pollo y cuántos de queso para agregar esos insumos al consumo final.")
-        lineas.append("Ejemplo: --rollitos-pollo 1 --rollitos-queso 1")
+        lineas.append("¿Cuántos fueron de pollo y cuántos de queso?")
 
     return "\n".join(lineas)

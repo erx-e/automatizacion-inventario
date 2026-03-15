@@ -36,18 +36,25 @@ scp credentials.json root@<IP_VPS>:/root/
 docker cp /root/credentials.json <contenedor>:/root/.openclaw/skills/motor-sambo/
 ```
 
-## Paso 4: Editar config.py
+## Paso 4: Configurar variables de entorno
 
+Crear el archivo `.env` en la raíz del proyecto:
 ```bash
 cd ~/.openclaw/skills/motor-sambo
-nano config.py
+nano .env
 ```
 
 Completar:
-- `NEXOS_API_KEY`: tu API key de Nexos.ai (está en hPanel → OpenClaw)
-- `SHEET_REGISTROS`: ID del Google Sheet de registros
-- `SHEET_RECETAS`: ID del Google Sheet de recetas
-- `SHEET_INVENTARIO`: ID del Google Sheet de inventario
+```
+ANTHROPIC_API_KEY=sk-ant-api03-...
+GOOGLE_CREDENTIALS_PATH=/ruta/a/credentials.json
+SHEET_REGISTROS=ID_del_Google_Sheet_de_registros
+SHEET_RECETAS=ID_del_Google_Sheet_de_recetas
+SHEET_INVENTARIO=ID_del_Google_Sheet_de_inventario
+CLAUDE_MODEL=claude-sonnet-4-6
+UMBRAL_DESCUADRE=1
+SHEETS_WRITE_DELAY_SECONDS=10
+```
 
 Los IDs se copian de la URL: `docs.google.com/spreadsheets/d/ESTE_ES_EL_ID/edit`
 
@@ -56,12 +63,15 @@ Los IDs se copian de la URL: `docs.google.com/spreadsheets/d/ESTE_ES_EL_ID/edit`
 ```bash
 cd ~/.openclaw/skills/motor-sambo
 
+# Tests unitarios:
+python3 -m unittest discover -s tests -v
+
 # Test conexión a Google Sheets:
 python3 -c "from sheets_connector import leer_recetas; print(f'Recetas: {len(leer_recetas())}')"
 
 # Test parseo de imagen:
 python3 main.py /ruta/a/foto.jpg --solo-leer
 
-# Test cierre completo:
-python3 main.py /ruta/a/foto.jpg
+# Test preview de cierre:
+python3 main.py /ruta/a/foto.jpg --preparar
 ```

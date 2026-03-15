@@ -7,6 +7,8 @@ from motor import (
     ejecutar_cierre, solo_parsear_ticket, solo_consumo_teorico,
     preparar_cierre, confirmar_cierre, corregir_inventario_por_insumos,
     preparar_correccion, confirmar_correccion,
+    preparar_inventario_registros, confirmar_inventario_registros,
+    preparar_solo_ventas, confirmar_solo_ventas,
 )
 
 
@@ -46,17 +48,25 @@ def _leer_insumos(argv: list[str], flag: str) -> list[str] | None:
     return insumos
 
 
+def _leer_fecha(argv: list[str]) -> str | None:
+    if "--fecha" not in argv:
+        return None
+    idx = argv.index("--fecha")
+    if idx + 1 < len(argv):
+        return argv[idx + 1]
+    return None
+
+
 def main():
     if len(sys.argv) < 2:
         print("Uso:")
         print("  python3 main.py <imagen>                     → Cierre completo (sin confirmación)")
         print("  python3 main.py <imagen> --solo-leer          → Solo parsear el ticket")
         print("  python3 main.py <imagen> --consumo            → Solo consumo teórico")
-        print("  python3 main.py <imagen> --consumo --usar-registros-rollitos")
         print("  python3 main.py <imagen> --preparar           → Preparar cierre (pide confirmación)")
+        print("  python3 main.py <imagen> --solo-ventas        → Solo cargar ventas a entrada existente")
+        print("  python3 main.py --solo-registros              → Inventario solo desde registros (sin foto)")
         print("  python3 main.py <imagen> --fecha 2026-03-11   → Con fecha específica")
-        print("  python3 main.py <imagen> --rollitos-pollo 1 --rollitos-queso 1")
-        print("  python3 main.py <imagen> --preparar-correccion 'INS1,INS2'  → Preview corrección")
         sys.exit(1)
 
     try:
@@ -65,8 +75,30 @@ def main():
         print(f"❌ {str(e)}")
         sys.exit(1)
 
+    # --solo-registros no requiere imagen
+    if "--solo-registros" in sys.argv:
+        fecha = _leer_fecha(sys.argv)
+        confirmar = "--confirmar" in sys.argv
+        prep = preparar_inventario_registros(fecha=fecha)
+        print(prep["resumen"])
+        if not prep["ok"]:
+            return
+        if confirmar:
+            print("\n" + confirmar_inventario_registros(prep))
+        elif sys.stdin.isatty():
+            respuesta = input("\n> ").strip().lower()
+            if respuesta in ("si", "dale", "ok"):
+                print("\n" + confirmar_inventario_registros(prep))
+            else:
+                print("❌ Cancelado.")
+        return
+
+    if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
+        print("❌ Falta la ruta de la imagen del ticket.")
+        sys.exit(1)
+
     image_path = sys.argv[1]
-    fecha = None
+    fecha = _leer_fecha(sys.argv)
     usar_registros_rollitos = "--usar-registros-rollitos" in sys.argv
     try:
         rollitos_override = _leer_rollitos_override(sys.argv)
@@ -75,11 +107,6 @@ def main():
     except ValueError as e:
         print(f"❌ {str(e)}")
         sys.exit(1)
-
-    if "--fecha" in sys.argv:
-        idx = sys.argv.index("--fecha")
-        if idx + 1 < len(sys.argv):
-            fecha = sys.argv[idx + 1]
 
     if "--solo-leer" in sys.argv:
         print(solo_parsear_ticket(image_path=image_path))
@@ -94,6 +121,26 @@ def main():
         ))
         return
 
+    if "--solo-ventas" in sys.argv:
+        prep = preparar_solo_ventas(
+            image_path=image_path,
+            fecha=fecha,
+            rollitos_override=rollitos_override,
+        )
+        print(prep["resumen"])
+        if not prep["ok"]:
+            return
+        confirmar = "--confirmar" in sys.argv
+        if confirmar:
+            print("\n" + confirmar_solo_ventas(prep))
+        elif sys.stdin.isatty():
+            respuesta = input("\n> ").strip().lower()
+            if respuesta in ("si", "dale", "ok"):
+                print("\n" + confirmar_solo_ventas(prep))
+            else:
+                print("❌ Cancelado.")
+        return
+
     if "--preparar" in sys.argv:
         prep = preparar_cierre(
             image_path=image_path,
@@ -105,7 +152,10 @@ def main():
         if not prep["ok"]:
             return
 
-        # Pedir confirmación
+        # Solo pedir confirmación interactiva si hay terminal
+        if not sys.stdin.isatty():
+            return
+
         respuesta = input("\n> ").strip().lower()
 
         if respuesta == "si":
@@ -137,6 +187,10 @@ def main():
         print(prep["resumen"])
         if not prep["ok"]:
             return
+
+        if not sys.stdin.isatty():
+            return
+
         respuesta = input("\n> ").strip().lower()
         if respuesta == "si":
             print("\n" + confirmar_correccion(prep))

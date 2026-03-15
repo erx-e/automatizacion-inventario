@@ -12,7 +12,34 @@ Usa este skill cuando el usuario quiera procesar una foto de cierre/preventa de 
 - `references/flujo-operativo.md` antes de tocar reglas de negocio, inventario o descuadres.
 - `references/google-sheets.md` antes de modificar cómo se ubica o escribe una nueva entrada en Google Sheets.
 
-## Flujo de conversación
+## Canal y tono
+
+El usuario final es personal del Restaurante Sambó que interactúa a través de un bot de Telegram.
+
+### Reglas de comunicación
+- **Lenguaje natural y directo.** No usar jerga técnica, flags de CLI ni nombres de archivos. El usuario no sabe qué es `--rollitos-pollo` ni `VENTAS NEOLA`.
+- **Mensajes cortos y claros.** Telegram es chat — no mandar párrafos largos. Separar en mensajes si es necesario.
+- **Emojis moderados** para distinguir secciones, pero sin exceso.
+- **No mencionar** nombres de hojas internas (`C1`, `C2`, `LINEA CALIENTE`) salvo en el reporte final de diferencias.
+- **No pedir formatos técnicos.** En vez de "fecha YYYY-MM-DD", preguntar "¿Para qué día es este cierre?" y aceptar respuestas como "hoy", "ayer", "11 de marzo".
+- **Confirmaciones simples.** "¿Todo bien? ¿Procedo?" — no instrucciones con comillas ni flechas.
+
+## Opciones disponibles
+
+El motor tiene tres caminos principales:
+
+| Opción | Qué hace | Requiere foto | Requisito previo |
+|--------|----------|---------------|------------------|
+| **1A — Cierre completo** | Parsea ticket + preview + escribe ventas e inventario | Sí | Ninguno |
+| **1B — Solo preview** | Parsea ticket + preview (sin escribir) | Sí | Ninguno |
+| **1C — Solo cargar ventas** | Parsea ticket + carga ventas a entrada existente | Sí | Entrada creada con Opción 2 |
+| **2 — Inventario desde registros** | Crea entradas del día usando solo registros | No | Registros del día deben existir |
+
+El flujo típico de dos pasos es: primero Opción 2 (crear entradas desde registros), luego Opción 1C (cargar ventas del ticket).
+
+---
+
+## Opción 1: Cierre desde ticket (foto)
 
 ### Paso 1: preparar preview
 Siempre empezar con preview. No escribir en Sheets todavía.
@@ -31,17 +58,17 @@ El preview debe mostrar:
 - si un plato no genera insumos: `Motivo: ...`
 - al final, total simple por insumo
 
-**Después de correr `--preparar`, SIEMPRE enviar el preview completo y formateado al usuario antes de pedir confirmación.** No asumir que el usuario ya lo vio en el output del comando. Mostrar:
+**Después de correr `--preparar`, SIEMPRE enviar el preview completo y formateado al usuario antes de pedir confirmación.** No asumir que el usuario ya lo vio en el output del comando. Reformatear el output del comando para que sea legible en Telegram:
 1. Fecha del cierre
 2. Cada plato con sus insumos (o motivo si no genera insumos)
 3. Total por insumo
 4. Alertas si las hay
-5. Solo después de mostrar todo esto, preguntar si confirma
+5. Solo después de mostrar todo esto, preguntar si confirma con una pregunta simple ("¿Todo bien? ¿Procedo con el cierre?")
 
 ### Paso 2: esperar confirmación
-- Si el usuario dice `si`, `confirmar` o equivalente: ejecutar el cierre.
-- Si responde `fecha YYYY-MM-DD`: confirmar usando esa fecha.
-- Si responde `no` o `cancelar`: no escribir nada.
+- Si el usuario dice `si`, `dale`, `confirmar`, `ok` o equivalente: ejecutar el cierre.
+- Si el usuario indica otra fecha (en cualquier formato): confirmar usando esa fecha.
+- Si responde `no`, `cancelar` o equivalente: no escribir nada.
 
 ### Paso 3: confirmar cierre
 ```bash
@@ -51,27 +78,82 @@ python3 main.py /ruta/a/imagen.jpg --fecha 2026-03-11
 Sin `--preparar`, el comando ejecuta el cierre completo.
 
 ### Paso 4: revisar diferencias finales
-Después de escribir, el output por defecto debe mostrar las diferencias reales finales del bloque del día agrupadas por:
-- `C1`
-- `C2`
-- `LINEA CALIENTE`
+Después de escribir, el output por defecto muestra las diferencias reales finales del bloque del día agrupadas por C1, C2 y LINEA CALIENTE.
 
-Cada diferencia debe salir con:
-- `INICIO`
-- `INGRESO`
-- `SALIDA`
-- `DIF`
-- `VENTAS`
-- `CIERRE`
-
-Ese reporte final es el que el usuario usa para decidir si hay errores de registro que corregir.
+Reformatear el reporte para Telegram de forma clara:
+- Si no hay diferencias: "✅ Todo cuadra, sin diferencias."
+- Si hay diferencias: listar cada insumo con su descuadre de forma legible, sin la línea completa de INICIO/INGRESO/SALIDA/etc. salvo que el usuario lo pida.
+- Preguntar si quiere corregir algo.
 
 ### Lógica de fecha automática:
-Los cierres de caja siempre corresponden al día que inició a las 19:00. Por eso:
-- **Antes de las 19:00** → fecha de **ayer** (el cierre pertenece al día anterior que arrancó a las 19:00)
-- **A partir de las 19:00** → fecha de **hoy** (el cierre pertenece al día que acaba de empezar)
+Los cierres de caja normalmente se procesan de noche. La lógica es:
+- **19:00 a 23:59** → fecha de **hoy** (cierre del día que acaba de terminar)
+- **00:00 a 03:59** → fecha de **ayer** (cierre tardío, corresponde al día anterior)
+- **04:00 a 18:59** → fecha de **hoy** (caso inusual/atrasado, asumimos el día actual)
 - Si el usuario indica fecha, se usa esa sin importar la hora
 - **Siempre mostrar la fecha sugerida al usuario y esperar confirmación antes de proceder**, incluso si se calculó automáticamente.
+
+### Paso 1C: Solo cargar ventas (entrada ya existe)
+
+Si el usuario ya creó la entrada del día con la Opción 2 y ahora quiere cargar las ventas del ticket:
+
+```bash
+cd {baseDir}
+python3 main.py /ruta/a/imagen.jpg --solo-ventas
+python3 main.py /ruta/a/imagen.jpg --solo-ventas --fecha 2026-03-11
+python3 main.py /ruta/a/imagen.jpg --solo-ventas --rollitos-pollo 1 --rollitos-queso 1
+```
+
+Si la entrada del día **no existe** en alguna hoja, el comando lo indica y pide crear la entrada primero (Opción 2).
+
+El preview muestra los mismos platos e insumos que el cierre completo, pero aclara que **solo se actualizarán las VENTAS** (la entrada ya tiene INICIO, INGRESO y SALIDA de los registros).
+
+Después de mostrar el preview, preguntar: "¿Cargo las ventas?"
+
+Para confirmar:
+```bash
+python3 main.py /ruta/a/imagen.jpg --solo-ventas --confirmar
+```
+
+---
+
+## Opción 2: Inventario solo desde registros (sin foto)
+
+El usuario pide crear las entradas del día usando únicamente los registros de la hoja de registros. No se necesita foto de ticket.
+
+```bash
+cd {baseDir}
+python3 main.py --solo-registros
+python3 main.py --solo-registros --fecha 2026-03-11
+```
+
+**Requisito:** los registros del día deben existir. Si no hay movimientos registrados, el comando lo indica y pide que se completen primero.
+
+El preview muestra:
+- Fecha
+- Movimientos por ubicación (C1, C2, LINEA CALIENTE): ingresos, salidas, conteos
+- Aviso de que VENTAS quedará vacío hasta que se procese el ticket
+
+Después de mostrar el preview, preguntar: "¿Todo correcto? ¿Procedo?"
+
+Para confirmar:
+```bash
+python3 main.py --solo-registros --confirmar
+python3 main.py --solo-registros --fecha 2026-03-11 --confirmar
+```
+
+Después de confirmar, el resultado muestra:
+- Confirmación de que las entradas se crearon
+- Aviso de que VENTAS está vacío y debe procesarse el ticket cuando esté listo
+- Diferencias actuales (que serán altas porque no hay ventas aún)
+
+**Flujo natural en Telegram:**
+- Usuario: "Crea las entradas del día con los registros" o "Solo registros de hoy"
+- Bot: muestra el preview con los movimientos del día
+- Usuario: "Dale" / "Sí" / "Procede"
+- Bot: confirma y muestra resultado
+
+---
 
 ### Otros comandos:
 ```bash
@@ -86,9 +168,9 @@ python3 main.py /ruta/a/imagen.jpg --fecha 2026-03-13 --corregir-insumos "POLLO 
 Si el usuario pide solo consumo y hay `ROLLITOS RELLENO` ambiguo:
 - mostrar el resto de insumos normalmente
 - dejar `ROLLITOS RELLENO` como pendiente de confirmar
-- al final pedir cuántos fueron de pollo y cuántos de queso
+- preguntar al usuario de forma natural: "Los rollitos, ¿cuántos fueron de pollo y cuántos de queso?"
 - no consultar registros de entradas o salidas para resolverlo
-- cuando el usuario lo aclare, volver a correr con `--rollitos-pollo N --rollitos-queso N`
+- cuando el usuario lo aclare (ej: "2 de pollo y 1 de queso"), volver a correr con `--rollitos-pollo N --rollitos-queso N`
 
 Solo si el usuario pide explícitamente revisar registros para resolver rollitos:
 - usar `--usar-registros-rollitos`
@@ -104,8 +186,8 @@ Si aparece `ENSALADA CAESAR` sin proteína explícita:
 Si el plato del ticket no tiene match exacto en el nombre corto de recetas:
 - no aplicar una receta por prefijo o fragmento
 - buscar la receta más similar y mostrársela al usuario como confirmación
-- usar un mensaje del estilo:
-  `en recetas existe 'TABLA QUESOS EMB', pero en el ticket sale 'TABLA DE QUESOS'. ¿Cambio el nombre de la receta a 'TABLA DE QUESOS' y aplico esa receta?`
+- preguntar de forma natural, por ejemplo:
+  "En las recetas tenemos 'TABLA QUESOS EMB' pero en el ticket sale 'TABLA DE QUESOS'. ¿Es el mismo plato? Si confirmas, actualizo el nombre."
 - bloquear el cierre hasta que esa receta quede confirmada
 
 ## Reglas críticas

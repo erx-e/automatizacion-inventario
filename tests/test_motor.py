@@ -109,6 +109,11 @@ def cargar_motor():
         "C2": [],
         "LINEA CALIENTE": [],
     }
+    sheets_module.verificar_inventario_dia_existe = lambda fecha: {
+        "C1": True,
+        "C2": True,
+        "LINEA CALIENTE": True,
+    }
     sys.modules["sheets_connector"] = sheets_module
 
     motor = importlib.import_module("motor")
@@ -368,7 +373,7 @@ class RollitosRellenosTests(unittest.TestCase):
         self.assertIn("   • ROLLITOS RELLENO x2", salida)
         self.assertIn("      - Motivo: Pendiente definir si es de pollo o queso", salida)
         self.assertIn("Tipo de rollitos vendidos por confirmar", salida)
-        self.assertIn("agregar esos insumos al consumo final", salida)
+        self.assertIn("Cuántos fueron de pollo y cuántos de queso", salida)
         self.assertNotIn("REGISTRO C2", salida)
 
     def test_solo_consumo_no_consulta_registros_para_rollitos(self):
@@ -529,7 +534,7 @@ class FormatoPreviewTests(unittest.TestCase):
 
         self.assertFalse(preparacion["ok"])
         self.assertTrue(preparacion["requiere_aclaracion"])
-        self.assertIn("No se puede continuar hasta confirmar la receta similar sugerida", preparacion["resumen"])
+        self.assertIn("no coincide exactamente con las recetas", preparacion["resumen"])
         self.assertIn("TABLA QUESOS EMB", preparacion["resumen"])
 
     def test_solo_consumo_teorico_usa_el_mismo_formato_para_mensajeria(self):
@@ -612,6 +617,161 @@ class HistorialCierreTests(unittest.TestCase):
             self.assertEqual(historial["fecha"], "2026-03-13")
             self.assertIn("HAMBURGUESA (180gr)", historial["consumo_agrupado"])
             self.assertEqual(historial["consumo_agrupado"]["HAMBURGUESA (180gr)"]["total"], 7)
+
+
+class InventarioRegistrosTests(unittest.TestCase):
+    def test_preparar_inventario_registros_muestra_preview(self):
+        motor, state = cargar_motor()
+        state["registros"] = {
+            "C1": {"POLLO 200 gr": {"ingreso": 5, "salida": 2, "motivo": ""}},
+            "C2": {"CREPE POLLO 2 unid": {"ingreso": 0, "salida": 3, "motivo": "venta"}},
+            "LINEA": {},
+        }
+
+        prep = motor.preparar_inventario_registros(fecha="2026-03-14")
+
+        self.assertTrue(prep["ok"])
+        self.assertEqual(prep["fecha"], "2026-03-14")
+        self.assertIn("INVENTARIO DESDE REGISTROS", prep["resumen"])
+        self.assertIn("POLLO 200 gr", prep["resumen"])
+        self.assertIn("ingreso=5", prep["resumen"])
+        self.assertIn("salida=2", prep["resumen"])
+        self.assertIn("CREPE POLLO 2 unid", prep["resumen"])
+        self.assertIn("¿Todo correcto?", prep["resumen"])
+
+    def test_preparar_inventario_registros_falla_sin_registros(self):
+        motor, state = cargar_motor()
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+
+        prep = motor.preparar_inventario_registros(fecha="2026-03-14")
+
+        self.assertFalse(prep["ok"])
+        self.assertIn("No hay registros", prep["resumen"])
+
+    def test_confirmar_inventario_registros_escribe_con_ventas_vacias(self):
+        motor, state = cargar_motor()
+        state["registros"] = {
+            "C1": {"POLLO 200 gr": {"ingreso": 5, "salida": 2, "motivo": ""}},
+            "C2": {},
+            "LINEA": {},
+        }
+        state["ubicaciones"] = {"POLLO 200 gr": "C1"}
+
+        preparacion = {
+            "fecha": "2026-03-14",
+            "registros": state["registros"],
+            "ubicaciones": state["ubicaciones"],
+        }
+        resultado = motor.confirmar_inventario_registros(preparacion)
+
+        self.assertIn("INVENTARIO CREADO", resultado)
+        self.assertIn("2026-03-14", resultado)
+        self.assertIn("VENTAS está vacío", resultado)
+        self.assertEqual(len(state["inventario_writes"]), 1)
+        fecha, consumo, registros, ubicaciones = state["inventario_writes"][0]
+        self.assertEqual(fecha, "2026-03-14")
+        self.assertEqual(consumo, {})  # Ventas vacías
+
+    def test_preparar_inventario_registros_usa_fecha_sugerida(self):
+        motor, state = cargar_motor()
+        state["registros"] = {
+            "C1": {"POLLO 200 gr": {"ingreso": 1, "salida": 0, "motivo": ""}},
+            "C2": {},
+            "LINEA": {},
+        }
+
+        FakeDateTime.current = datetime(2026, 3, 14, 10, 30)
+        with mock.patch.object(motor, "datetime", FakeDateTime):
+            prep = motor.preparar_inventario_registros()
+
+        self.assertTrue(prep["ok"])
+        self.assertEqual(prep["fecha"], "2026-03-14")
+
+
+class SoloVentasTests(unittest.TestCase):
+    def test_preparar_solo_ventas_falla_si_entrada_no_existe(self):
+        motor, state = cargar_motor()
+        motor.verificar_inventario_dia_existe = lambda fecha: {
+            "C1": True,
+            "C2": False,
+            "LINEA CALIENTE": True,
+        }
+
+        prep = motor.preparar_solo_ventas(image_path="ticket.jpg", fecha="2026-03-14")
+
+        self.assertFalse(prep["ok"])
+        self.assertIn("No existe la entrada", prep["resumen"])
+        self.assertIn("C2", prep["resumen"])
+
+    def test_preparar_solo_ventas_muestra_preview_si_entrada_existe(self):
+        motor, state = cargar_motor()
+        state["ventas"] = [
+            {"plato": "HAMBURGUESA GOLD", "cantidad": 2, "precio_total": 19.98},
+        ]
+        state["recetas"] = [
+            {"plato": "HAMBURGUESA GOLD", "sku": "RES-010", "insumo": "HAMBURGUESA (180gr)", "cantidad": 1, "unidad": "UND", "ubicacion": "C1"},
+        ]
+        state["consumo"] = [
+            {
+                "plato": "HAMBURGUESA GOLD",
+                "cantidad_platos": 2,
+                "insumo": "HAMBURGUESA (180gr)",
+                "sku": "RES-010",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 2,
+                "unidad": "UND",
+                "ubicacion": "C1",
+            },
+        ]
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+
+        prep = motor.preparar_solo_ventas(image_path="ticket.jpg", fecha="2026-03-14")
+
+        self.assertTrue(prep["ok"])
+        self.assertTrue(prep.get("solo_ventas"))
+        self.assertIn("CARGAR VENTAS", prep["resumen"])
+        self.assertIn("Solo se actualizarán las VENTAS", prep["resumen"])
+        self.assertIn("HAMBURGUESA GOLD", prep["resumen"])
+        self.assertIn("¿Cargo las ventas?", prep["resumen"])
+
+    def test_preparar_solo_ventas_falla_si_todas_las_hojas_faltan(self):
+        motor, state = cargar_motor()
+        motor.verificar_inventario_dia_existe = lambda fecha: {
+            "C1": False,
+            "C2": False,
+            "LINEA CALIENTE": False,
+        }
+
+        prep = motor.preparar_solo_ventas(image_path="ticket.jpg", fecha="2026-03-14")
+
+        self.assertFalse(prep["ok"])
+        self.assertIn("C1", prep["resumen"])
+        self.assertIn("C2", prep["resumen"])
+        self.assertIn("LINEA CALIENTE", prep["resumen"])
+        self.assertIn("Primero crea la entrada", prep["resumen"])
+
+    def test_confirmar_solo_ventas_ejecuta_cierre(self):
+        motor, state = cargar_motor()
+        state["ubicaciones"] = {}
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+
+        preparacion = {
+            "fecha": "2026-03-14",
+            "ventas": [{"plato": "HAMBURGUESA GOLD", "cantidad": 2, "precio_total": 19.98}],
+            "ventas_originales": [{"plato": "HAMBURGUESA GOLD", "cantidad": 2, "precio_total": 19.98}],
+            "consumo": [],
+            "consumo_agrupado": {},
+            "alertas": [],
+            "solo_ventas": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            motor.CIERRES_DIR = Path(tmp_dir) / "cierres"
+            resultado = motor.confirmar_solo_ventas(preparacion)
+
+        self.assertIsInstance(resultado, str)
+        self.assertEqual(len(state["ventas_writes"]), 1)
+        self.assertEqual(len(state["inventario_writes"]), 1)
 
 
 class PrepararCorreccionTests(unittest.TestCase):

@@ -5,17 +5,24 @@ Sistema de cierre diario de inventario para el Restaurante Sambó (Ecuador). Pro
 ## Quick reference
 
 ```bash
-# Tests (37 tests, sin pytest — usa unittest)
+# Tests (sin pytest — usa unittest)
 python3 -m unittest discover -s tests -v
 
-# CLI
-python3 main.py <imagen> --preparar                         # Preview
-python3 main.py <imagen> --preparar --fecha 2026-03-11      # Con fecha
+# CLI — Opción 1 (con foto de ticket)
+python3 main.py <imagen> --preparar                         # Preview cierre
+python3 main.py <imagen> --preparar --fecha 2026-03-11      # Preview con fecha
+python3 main.py <imagen> --solo-ventas                      # Solo cargar ventas a entrada existente
+python3 main.py <imagen> --solo-ventas --confirmar           # Confirmar carga de ventas
 python3 main.py <imagen> --solo-leer                        # Solo parsear ticket
 python3 main.py <imagen> --consumo                          # Solo consumo teórico
 python3 main.py <imagen> --fecha YYYY-MM-DD                 # Cierre directo
 python3 main.py <imagen> --corregir-insumos "POLLO 200 gr,CERDO 180 gr"
 python3 main.py <imagen> --preparar-correccion "POLLO 200 gr"   # Preview corrección
+
+# CLI — Opción 2 (sin foto, solo registros)
+python3 main.py --solo-registros                            # Preview inventario desde registros
+python3 main.py --solo-registros --fecha 2026-03-11         # Con fecha
+python3 main.py --solo-registros --confirmar                # Confirmar escritura
 ```
 
 ## Stack
@@ -60,7 +67,7 @@ Foto ticket → [parser_neola + Claude] → ventas JSON
 - Escritura de VENTAS NEOLA incluye validación post-write con hasta 3 reintentos automáticos.
 
 ### Business rules (critical — read references/ before changing)
-- **Fecha automática:** antes de 19:00 → ayer; desde 19:00 → hoy. Madrugada (00:00-03:59) → ayer.
+- **Fecha automática:** 19:00-23:59 → hoy (cierre del día); 00:00-03:59 → ayer (cierre tardío); 04:00-18:59 → hoy (caso inusual, asumimos hoy).
 - **ROLLITOS RELLENO:** ambiguo, requiere resolución pollo/queso antes del cierre. Se resuelve vía REGISTRO C2 o override manual.
 - **ENSALADA CAESAR sin proteína:** default a pollo, siempre explicitado en preview.
 - **Match de recetas:** solo exacto sobre nombre corto normalizado. Si no hay match, sugerir la más similar y bloquear hasta confirmar. Nunca `startswith` automático.
@@ -86,7 +93,7 @@ Variables requeridas:
 python3 -m unittest discover -s tests -v
 ```
 
-- 37 tests, todos unitarios con mocks de módulos
+- Todos unitarios con mocks de módulos
 - No requieren conexión a Google Sheets ni API de Anthropic
 - Los tests de `motor.py` reemplazan completamente `parser_neola`, `recetas`, `sheets_connector` y `config` vía `sys.modules`
 - Tests de `recetas.py` y `sheets_connector.py` solo mockean dependencias externas (anthropic, gspread, google-auth)

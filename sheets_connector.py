@@ -912,6 +912,19 @@ def _indices_bloque_inventario(headers: list[str]) -> dict[str, int]:
     return indices
 
 
+def verificar_inventario_dia_existe(fecha: str) -> dict[str, bool]:
+    """Verifica si la entrada del día existe en cada hoja de inventario."""
+    gc = get_client()
+    sh = gc.open_by_key(SHEET_INVENTARIO)
+    resultado = {}
+    for hoja in ("C1", "C2", "LINEA CALIENTE"):
+        ws = sh.worksheet(hoja)
+        fila_mes, fila_fechas, fila_headers, fila_datos, fila_fin = _buscar_seccion_mes_inventario(ws, fecha)
+        col = _buscar_bloque_fecha_inventario(ws, fila_fechas, fecha)
+        resultado[hoja] = col is not None
+    return resultado
+
+
 def leer_diferencias_inventario_dia(fecha: str) -> dict[str, list[dict]]:
     gc = get_client()
     sh = gc.open_by_key(SHEET_INVENTARIO)
