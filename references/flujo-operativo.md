@@ -232,7 +232,9 @@ Esto evita perder ventas registradas manualmente, como `CREPE POLLO 2 unid`.
 
 - `INGRESO` = ingreso registrado en línea + transferencias desde `C1/C2`.
 - Una transferencia existe cuando un insumo salió de `C1/C2` y en `UBICACION DESCUENTO` su `DESCUENTO POR DEFECTO` es `LINEA`.
-- `VENTAS` = consumo teórico que corresponde a línea.
+- `VENTAS`:
+  - usar la salida registrada en línea si existe
+  - si no existe, usar el consumo teórico que corresponde a línea
 
 #### Cuando sí hay conteo
 
@@ -276,6 +278,7 @@ En la hoja diaria:
 - En flujos incrementales, primero actualizar `VENTAS NEOLA` y después recalcular inventario.
 - En flujos incrementales, si falla `VENTAS NEOLA`, no tocar inventario.
 - En correcciones puntuales, no reescribir todo el inventario diario.
+- Al cruzar recetas, registros y `UBICACION DESCUENTO`, intentar primero match exacto y luego un match normalizado para tolerar tildes, mayúsculas y sufijos como `2 unid`.
 
 ## Cuándo bloquear
 

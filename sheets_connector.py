@@ -1,5 +1,7 @@
 from datetime import datetime
 import time
+import re
+import unicodedata
 import gspread
 from google.oauth2.service_account import Credentials
 from config import (
@@ -15,9 +17,15 @@ SCOPES = [
 ]
 
 _client = None
+_spreadsheet_cache = {}
+_worksheet_cache = {}
+_master_cache = {}
 VALORES_CONFIRMACION_RECETA = {"✅", "❓"}
 MAX_INSUMOS_POR_PLATO_VENTAS = 6
 COLUMNAS_VENTAS_NEOLA = 3 + (MAX_INSUMOS_POR_PLATO_VENTAS * 2)
+SHEETS_MAX_RETRIES = 5
+SHEETS_RETRY_BASE_SECONDS = 3
+SHEETS_RETRY_MAX_SECONDS = 45
 MESES_ES = {
     1: "ENERO",
     2: "FEBRERO",
@@ -38,12 +46,71 @@ def _esperar_despues_de_write():
     if SHEETS_WRITE_DELAY_SECONDS > 0:
         time.sleep(SHEETS_WRITE_DELAY_SECONDS)
 
+
+def _es_error_reintentable_sheets(exc: Exception) -> bool:
+    texto = str(exc).upper()
+    marcadores = (
+        "429",
+        "QUOTA EXCEEDED",
+        "RATE LIMIT EXCEEDED",
+        "READ REQUESTS PER MINUTE PER USER",
+        "WRITE REQUESTS PER MINUTE PER USER",
+        "RESOURCE_EXHAUSTED",
+        "503",
+        "502",
+        "504",
+        "SERVICE UNAVAILABLE",
+        "INTERNAL ERROR ENCOUNTERED",
+    )
+    return any(marker in texto for marker in marcadores)
+
+
+def _ejecutar_con_retry_sheets(fn, *, operacion: str):
+    ultimo_error = None
+    for intento in range(SHEETS_MAX_RETRIES + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            ultimo_error = exc
+            if intento >= SHEETS_MAX_RETRIES or not _es_error_reintentable_sheets(exc):
+                raise
+            espera = min(SHEETS_RETRY_BASE_SECONDS * (2 ** intento), SHEETS_RETRY_MAX_SECONDS)
+            time.sleep(espera)
+    raise ultimo_error
+
+
+def _nombre_ws(ws) -> str:
+    return getattr(ws, "title", ws.__class__.__name__)
+
+
 def get_client():
     global _client
     if _client is None:
         creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_PATH, scopes=SCOPES)
         _client = gspread.authorize(creds)
     return _client
+
+
+def _abrir_spreadsheet(sheet_key: str):
+    client = get_client()
+    cache_key = (id(client), sheet_key)
+    if cache_key not in _spreadsheet_cache:
+        _spreadsheet_cache[cache_key] = _ejecutar_con_retry_sheets(
+            lambda: client.open_by_key(sheet_key),
+            operacion=f"abrir spreadsheet {sheet_key}",
+        )
+    return _spreadsheet_cache[cache_key]
+
+
+def _obtener_worksheet(sheet_key: str, worksheet_name: str):
+    client = get_client()
+    clave = (id(client), sheet_key, worksheet_name)
+    if clave not in _worksheet_cache:
+        _worksheet_cache[clave] = _ejecutar_con_retry_sheets(
+            lambda: _abrir_spreadsheet(sheet_key).worksheet(worksheet_name),
+            operacion=f"abrir worksheet {worksheet_name}",
+        )
+    return _worksheet_cache[clave]
 
 
 # ============================================================
@@ -64,17 +131,29 @@ def _leer_valores_hoja(ws, range_name: str | None = None) -> list[list[str]]:
 
     if hasattr(ws, "get_values"):
         try:
-            return ws.get_values(**kwargs)
+            return _ejecutar_con_retry_sheets(
+                lambda: ws.get_values(**kwargs),
+                operacion=f"leer valores de {_nombre_ws(ws)}",
+            )
         except TypeError:
             pass
 
     if hasattr(ws, "get_all_values"):
         try:
-            return ws.get_all_values(**kwargs)
+            return _ejecutar_con_retry_sheets(
+                lambda: ws.get_all_values(**kwargs),
+                operacion=f"leer valores de {_nombre_ws(ws)}",
+            )
         except TypeError:
             if range_name:
-                return ws.get_all_values(range_name)
-            return ws.get_all_values()
+                return _ejecutar_con_retry_sheets(
+                    lambda: ws.get_all_values(range_name),
+                    operacion=f"leer valores de {_nombre_ws(ws)}",
+                )
+            return _ejecutar_con_retry_sheets(
+                lambda: ws.get_all_values(),
+                operacion=f"leer valores de {_nombre_ws(ws)}",
+            )
 
     return []
 
@@ -134,43 +213,46 @@ def _parsear_recetas_rows(rows: list[list[str]]) -> list[dict]:
 
 
 def leer_recetas() -> list[dict]:
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_RECETAS)
-    ws = sh.worksheet(HOJA_RECETAS)
-    rows = _leer_valores_hoja(ws, f"A1:I{ws.row_count}")
-    return _parsear_recetas_rows(rows)
+    if "recetas" not in _master_cache:
+        ws = _obtener_worksheet(SHEET_RECETAS, HOJA_RECETAS)
+        rows = _leer_valores_hoja(ws, f"A1:I{ws.row_count}")
+        _master_cache["recetas"] = _parsear_recetas_rows(rows)
+    return _master_cache["recetas"]
 
 
 def leer_ubicacion_descuento() -> dict:
-    return {
-        insumo: datos["descuento"]
-        for insumo, datos in leer_tabla_ubicacion_descuento().items()
-    }
+    if "ubicacion_descuento" not in _master_cache:
+        _master_cache["ubicacion_descuento"] = {
+            insumo: datos["descuento"]
+            for insumo, datos in leer_tabla_ubicacion_descuento().items()
+        }
+    return _master_cache["ubicacion_descuento"]
 
 
 def leer_tabla_ubicacion_descuento() -> dict:
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_REGISTROS)
-    ws = sh.worksheet(HOJA_UBICACION)
-    rows = ws.get_all_values()
+    if "tabla_ubicacion" not in _master_cache:
+        ws = _obtener_worksheet(SHEET_REGISTROS, HOJA_UBICACION)
+        rows = _leer_valores_hoja(ws)
 
-    ubicaciones = {}
-    for row in rows[1:]:
-        insumo_raw = row[0] if row else ""
-        if not insumo_raw or insumo_raw.startswith(" "):
-            continue
+        ubicaciones = {}
+        for row in rows[1:]:
+            insumo_raw = row[0] if row else ""
+            if not insumo_raw or insumo_raw.startswith(" "):
+                continue
 
-        insumo = insumo_raw.strip()
-        almacen = row[2].strip() if len(row) > 2 and row[2] else ""
-        descuento = row[3].strip() if len(row) > 3 and row[3] else almacen
+            insumo = insumo_raw.strip()
+            almacen = row[2].strip() if len(row) > 2 and row[2] else ""
+            descuento = row[3].strip() if len(row) > 3 and row[3] else almacen
 
-        if insumo:
-            ubicaciones[insumo] = {
-                "almacen": almacen,
-                "descuento": descuento,
-            }
+            if insumo:
+                ubicaciones[insumo] = {
+                    "almacen": almacen,
+                    "descuento": descuento,
+                }
 
-    return ubicaciones
+        _master_cache["tabla_ubicacion"] = ubicaciones
+
+    return _master_cache["tabla_ubicacion"]
 
 
 # ============================================================
@@ -202,6 +284,51 @@ def _parsear_numero(raw: str) -> int:
         return int(float(raw)) if str(raw).strip() else 0
     except (ValueError, TypeError):
         return 0
+
+
+def _normalizar_nombre_insumo(nombre: str) -> str:
+    texto = unicodedata.normalize("NFKD", str(nombre).upper())
+    texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
+    texto = re.sub(r"[^A-Z0-9]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def _normalizar_base_insumo(nombre: str) -> str:
+    texto = re.sub(r"\([^)]*\)", " ", str(nombre))
+    tokens = _normalizar_nombre_insumo(texto).split()
+    unidades_empaque = {
+        "UND", "UNID", "UNIDS", "UNIDAD", "UNIDADES",
+    }
+    while len(tokens) >= 2 and tokens[-2].isdigit() and tokens[-1] in unidades_empaque:
+        tokens = tokens[:-2]
+    return " ".join(tokens)
+
+
+def _resolver_clave_mapa(mapa: dict, clave: str) -> str | None:
+    if clave in mapa:
+        return clave
+
+    objetivo = _normalizar_nombre_insumo(clave)
+    coincidencias = [candidate for candidate in mapa if _normalizar_nombre_insumo(candidate) == objetivo]
+    if len(coincidencias) == 1:
+        return coincidencias[0]
+
+    objetivo_base = _normalizar_base_insumo(clave)
+    if len(objetivo_base.split()) < 2:
+        return None
+
+    coincidencias = [candidate for candidate in mapa if _normalizar_base_insumo(candidate) == objetivo_base]
+    if len(coincidencias) == 1:
+        return coincidencias[0]
+
+    return None
+
+
+def _obtener_valor_mapa(mapa: dict, clave: str, default=None):
+    clave_real = _resolver_clave_mapa(mapa, clave)
+    if clave_real is None:
+        return default
+    return mapa[clave_real]
 
 
 def _tiene_dato(raw: str) -> bool:
@@ -269,9 +396,7 @@ def _parsear_registro_rows(rows: list[list[str]], fecha: str) -> dict:
 
 
 def leer_registro_dia(hoja_nombre: str, fecha: str) -> dict:
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_REGISTROS)
-    ws = sh.worksheet(hoja_nombre)
+    ws = _obtener_worksheet(SHEET_REGISTROS, hoja_nombre)
     rows = _leer_valores_hoja(
         ws,
         f"A1:{gspread.utils.rowcol_to_a1(ws.row_count, ws.col_count)}",
@@ -438,14 +563,23 @@ def _validar_bloque_ventas_neola(rows_bloque: list[list[str]], ventas: list[dict
 def _escribir_bloque_ventas_neola(ws, next_row: int, rows_to_write: list[list[str]], filas_a_limpiar: int):
     ultima_columna = gspread.utils.rowcol_to_a1(1, COLUMNAS_VENTAS_NEOLA).rstrip("1")
     if filas_a_limpiar:
-        ws.update(
-            f"A{next_row}:{ultima_columna}{next_row + filas_a_limpiar - 1}",
-            [[""] * COLUMNAS_VENTAS_NEOLA for _ in range(filas_a_limpiar)],
+        _ejecutar_con_retry_sheets(
+            lambda: ws.update(
+                f"A{next_row}:{ultima_columna}{next_row + filas_a_limpiar - 1}",
+                [[""] * COLUMNAS_VENTAS_NEOLA for _ in range(filas_a_limpiar)],
+            ),
+            operacion=f"limpiar bloque en {_nombre_ws(ws)}",
         )
         _esperar_despues_de_write()
 
     if rows_to_write:
-        ws.update(f"A{next_row}:{ultima_columna}{next_row + len(rows_to_write) - 1}", rows_to_write)
+        _ejecutar_con_retry_sheets(
+            lambda: ws.update(
+                f"A{next_row}:{ultima_columna}{next_row + len(rows_to_write) - 1}",
+                rows_to_write,
+            ),
+            operacion=f"escribir bloque en {_nombre_ws(ws)}",
+        )
         _esperar_despues_de_write()
 
 
@@ -456,11 +590,17 @@ def _insertar_filas_ventas_neola(ws, row: int, cantidad: int):
     values = [[""] * COLUMNAS_VENTAS_NEOLA for _ in range(cantidad)]
     if hasattr(ws, "insert_rows"):
         try:
-            ws.insert_rows(values, row=row, inherit_from_before=True)
+            _ejecutar_con_retry_sheets(
+                lambda: ws.insert_rows(values, row=row, inherit_from_before=True),
+                operacion=f"insertar filas en {_nombre_ws(ws)}",
+            )
             _esperar_despues_de_write()
             return
         except TypeError:
-            ws.insert_rows(values, row=row)
+            _ejecutar_con_retry_sheets(
+                lambda: ws.insert_rows(values, row=row),
+                operacion=f"insertar filas en {_nombre_ws(ws)}",
+            )
             _esperar_despues_de_write()
             return
 
@@ -475,7 +615,10 @@ def _insertar_filas_ventas_neola(ws, row: int, cantidad: int):
             "inheritFromBefore": True,
         }
     }]
-    ws.spreadsheet.batch_update({"requests": requests})
+    _ejecutar_con_retry_sheets(
+        lambda: ws.spreadsheet.batch_update({"requests": requests}),
+        operacion=f"insertar dimension en {_nombre_ws(ws)}",
+    )
     _esperar_despues_de_write()
 
 
@@ -506,14 +649,16 @@ def _construir_filas_ventas_neola(fecha: str, ventas: list[dict], consumo: list[
 
 
 def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_REGISTROS)
-    ws = sh.worksheet(HOJA_VENTAS_NEOLA)
+    sh = _abrir_spreadsheet(SHEET_REGISTROS)
+    ws = _obtener_worksheet(SHEET_REGISTROS, HOJA_VENTAS_NEOLA)
     ventas_agrupadas = _agrupar_ventas_neola(ventas)
     rows_to_write = _construir_filas_ventas_neola(fecha, ventas, consumo)
 
     if ws.col_count < COLUMNAS_VENTAS_NEOLA:
-        ws.add_cols(COLUMNAS_VENTAS_NEOLA - ws.col_count)
+        _ejecutar_con_retry_sheets(
+            lambda: ws.add_cols(COLUMNAS_VENTAS_NEOLA - ws.col_count),
+            operacion=f"agregar columnas en {_nombre_ws(ws)}",
+        )
         _esperar_despues_de_write()
 
     all_values = _leer_valores_hoja(
@@ -524,7 +669,10 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
     next_row = fila_existente or (_ultima_fila_no_vacia(all_values) + 1)
     total_rows = next_row + len(ventas_agrupadas)
     if total_rows > ws.row_count:
-        ws.add_rows(total_rows - ws.row_count)
+        _ejecutar_con_retry_sheets(
+            lambda: ws.add_rows(total_rows - ws.row_count),
+            operacion=f"agregar filas en {_nombre_ws(ws)}",
+        )
         _esperar_despues_de_write()
 
     longitud_existente = _longitud_bloque_existente_ventas(all_values, fila_existente) if fila_existente else 0
@@ -579,7 +727,10 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
                     "pasteOrientation": "NORMAL",
                 }
             })
-        sh.batch_update({"requests": requests})
+        _ejecutar_con_retry_sheets(
+            lambda: sh.batch_update({"requests": requests}),
+            operacion=f"copiar formatos en {_nombre_ws(ws)}",
+        )
         _esperar_despues_de_write()
 
     filas_a_limpiar = max(len(rows_to_write), longitud_existente)
@@ -603,9 +754,7 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
 
 
 def leer_ventas_neola_dia(fecha: str) -> list[dict]:
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_REGISTROS)
-    ws = sh.worksheet(HOJA_VENTAS_NEOLA)
+    ws = _obtener_worksheet(SHEET_REGISTROS, HOJA_VENTAS_NEOLA)
     all_values = _leer_valores_hoja(
         ws,
         f"A1:{gspread.utils.rowcol_to_a1(ws.row_count, max(ws.col_count, COLUMNAS_VENTAS_NEOLA))}",
@@ -635,18 +784,24 @@ def _buscar_seccion_mes_inventario(ws, fecha: str) -> tuple[int, int, int, int, 
     mes = _nombre_mes_es(fecha)
     fecha_display = _fecha_a_display(fecha)
     sufijo_mes = fecha_display[2:]
-    col_a = ws.col_values(1)
+    col_a = _ejecutar_con_retry_sheets(
+        lambda: ws.col_values(1),
+        operacion=f"leer columna A de {_nombre_ws(ws)}",
+    )
 
     candidatos = []
     for idx, valor in enumerate(col_a, start=1):
         if valor.strip().upper() != mes:
             continue
-        fila_fechas = ws.row_values(idx + 1)
+        fila_fechas = _ejecutar_con_retry_sheets(
+            lambda: ws.row_values(idx + 1),
+            operacion=f"leer fila de fechas en {_nombre_ws(ws)}",
+        )
         if any(celda.strip().endswith(sufijo_mes) for celda in fila_fechas):
             candidatos.append(idx)
 
     if not candidatos:
-        raise ValueError(f"No se encontró la sección {mes} en {ws.title}")
+        raise ValueError(f"No se encontró la sección {mes} en {_nombre_ws(ws)}")
 
     fila_mes = candidatos[-1]
     siguiente_mes = None
@@ -664,17 +819,23 @@ def _buscar_seccion_mes_inventario(ws, fecha: str) -> tuple[int, int, int, int, 
 
 
 def _buscar_bloque_siguiente_inventario(ws, fila_fechas: int) -> tuple[int, int]:
-    valores = ws.row_values(fila_fechas)
+    valores = _ejecutar_con_retry_sheets(
+        lambda: ws.row_values(fila_fechas),
+        operacion=f"leer fila de fechas en {_nombre_ws(ws)}",
+    )
     cols_fecha = [i + 1 for i, val in enumerate(valores) if _es_fecha_display(val)]
     if not cols_fecha:
-        raise ValueError(f"No hay fechas en la fila {fila_fechas} de {ws.title}")
+        raise ValueError(f"No hay fechas en la fila {fila_fechas} de {_nombre_ws(ws)}")
     ultima_col = max(cols_fecha)
     return ultima_col, ultima_col + 6
 
 
 def _buscar_bloque_fecha_inventario(ws, fila_fechas: int, fecha: str) -> int | None:
     fecha_display = _fecha_a_display(fecha)
-    valores = ws.row_values(fila_fechas)
+    valores = _ejecutar_con_retry_sheets(
+        lambda: ws.row_values(fila_fechas),
+        operacion=f"leer fila de fechas en {_nombre_ws(ws)}",
+    )
     for i, val in enumerate(valores, start=1):
         if val.strip() == fecha_display:
             return i
@@ -682,7 +843,10 @@ def _buscar_bloque_fecha_inventario(ws, fila_fechas: int, fecha: str) -> int | N
 
 
 def _rango_ya_merged(ws, row: int, start_col: int, end_col: int) -> bool:
-    meta = ws.spreadsheet.fetch_sheet_metadata()
+    meta = _ejecutar_con_retry_sheets(
+        lambda: ws.spreadsheet.fetch_sheet_metadata(),
+        operacion=f"leer metadata de {_nombre_ws(ws)}",
+    )
     sheet = next(s for s in meta["sheets"] if s["properties"]["title"] == ws.title)
     for merge in sheet.get("merges", []):
         if (
@@ -699,7 +863,10 @@ def _rango_ya_merged(ws, row: int, start_col: int, end_col: int) -> bool:
 def _copiar_bloque_inventario(ws, fila_fechas: int, fila_headers: int, fila_inicio_datos: int,
                               fila_fin: int, col_origen: int, col_destino: int):
     if col_destino + 5 > ws.col_count:
-        ws.add_cols(col_destino + 5 - ws.col_count)
+        _ejecutar_con_retry_sheets(
+            lambda: ws.add_cols(col_destino + 5 - ws.col_count),
+            operacion=f"agregar columnas en {_nombre_ws(ws)}",
+        )
         _esperar_despues_de_write()
 
     requests = []
@@ -739,7 +906,10 @@ def _copiar_bloque_inventario(ws, fila_fechas: int, fila_headers: int, fila_inic
             }
         }
     ])
-    ws.spreadsheet.batch_update({"requests": requests})
+    _ejecutar_con_retry_sheets(
+        lambda: ws.spreadsheet.batch_update({"requests": requests}),
+        operacion=f"copiar bloque de inventario en {_nombre_ws(ws)}",
+    )
     _esperar_despues_de_write()
 
 
@@ -748,7 +918,10 @@ def _encontrar_fila_insumo(ws, insumo: str, col_nombre: int = 1) -> int | None:
     Busca la fila donde está el insumo en la columna A (match exacto).
     Devuelve el índice de fila (1-based) o None.
     """
-    col_values = ws.col_values(col_nombre)
+    col_values = _ejecutar_con_retry_sheets(
+        lambda: ws.col_values(col_nombre),
+        operacion=f"leer columna {col_nombre} de {_nombre_ws(ws)}",
+    )
     insumo_upper = insumo.upper().strip()
     for i, val in enumerate(col_values):
         if val.strip().upper() == insumo_upper:
@@ -759,7 +932,7 @@ def _encontrar_fila_insumo(ws, insumo: str, col_nombre: int = 1) -> int | None:
 def _agrupar_consumo_por_hoja(consumo_agrupado: dict, ubicaciones_defecto: dict) -> dict[str, dict[str, int]]:
     agrupado = {"C1": {}, "C2": {}, "LINEA": {}}
     for insumo, datos in consumo_agrupado.items():
-        ubicacion = ubicaciones_defecto.get(insumo, datos["ubicacion"])
+        ubicacion = _obtener_valor_mapa(ubicaciones_defecto, insumo, datos["ubicacion"])
         if ubicacion not in agrupado:
             ubicacion = "C1"
         agrupado[ubicacion][insumo] = datos["total"]
@@ -768,21 +941,20 @@ def _agrupar_consumo_por_hoja(consumo_agrupado: dict, ubicaciones_defecto: dict)
 
 def _ventas_esperadas_para_hoja(ubicacion_key: str, insumo: str, consumo_por_hoja: dict,
                                 registros: dict, tabla_ubicaciones: dict) -> int:
-    if ubicacion_key == "LINEA":
-        return consumo_por_hoja["LINEA"].get(insumo, 0)
-
-    salida_registrada = registros.get(ubicacion_key, {}).get(insumo, {}).get("salida", 0)
+    registro_insumo = _obtener_valor_mapa(registros.get(ubicacion_key, {}), insumo, {})
+    salida_registrada = registro_insumo.get("salida", 0) if registro_insumo else 0
     if salida_registrada:
         return salida_registrada
 
-    return consumo_por_hoja.get(ubicacion_key, {}).get(insumo, 0)
+    return _obtener_valor_mapa(consumo_por_hoja.get(ubicacion_key, {}), insumo, 0)
 
 
 def _ingresos_transferidos_a_linea(registros: dict, tabla_ubicaciones: dict) -> dict[str, int]:
     transferidos = {}
     for origen in ("C1", "C2"):
         for insumo, mov in registros.get(origen, {}).items():
-            if tabla_ubicaciones.get(insumo, {}).get("descuento") != "LINEA":
+            ubicacion = _obtener_valor_mapa(tabla_ubicaciones, insumo, {})
+            if ubicacion.get("descuento") != "LINEA":
                 continue
             salida = mov.get("salida", 0)
             if salida:
@@ -898,7 +1070,10 @@ def _fila_inventario_para_insumo(
 
 
 def _batch_update_user_entered(ws, data: list[dict]):
-    ws.batch_update(data, raw=False)
+    _ejecutar_con_retry_sheets(
+        lambda: ws.batch_update(data, raw=False),
+        operacion=f"escribir batch en {_nombre_ws(ws)}",
+    )
     _esperar_despues_de_write()
 
 
@@ -906,10 +1081,16 @@ def _contexto_bloque_inventario(ws, fecha: str) -> tuple[int, int, int, int, lis
     fila_mes, fila_fechas, fila_headers, fila_datos, fila_fin = _buscar_seccion_mes_inventario(ws, fecha)
     col_destino = _buscar_bloque_fecha_inventario(ws, fila_fechas, fecha)
     if col_destino is None:
-        raise ValueError(f"La fecha {fecha} no existe todavía en {ws.title}")
+        raise ValueError(f"La fecha {fecha} no existe todavía en {_nombre_ws(ws)}")
     col_origen = col_destino - 6
-    productos = ws.col_values(1)
-    cierres_previos = ws.col_values(col_origen + 5)
+    productos = _ejecutar_con_retry_sheets(
+        lambda: ws.col_values(1),
+        operacion=f"leer columna de productos en {_nombre_ws(ws)}",
+    )
+    cierres_previos = _ejecutar_con_retry_sheets(
+        lambda: ws.col_values(col_origen + 5),
+        operacion=f"leer cierres previos en {_nombre_ws(ws)}",
+    )
     return col_destino, fila_datos, fila_fin, col_origen, productos, cierres_previos
 
 
@@ -924,8 +1105,7 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
     INICIO | INGRESO | SALIDA | DIF | VENTAS | CIERRE
     """
     fecha_display = _fecha_a_display(fecha)
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_INVENTARIO)
+    sh = _abrir_spreadsheet(SHEET_INVENTARIO)
     tabla_ubicaciones = leer_tabla_ubicacion_descuento()
     consumo_por_hoja = _agrupar_consumo_por_hoja(consumo_agrupado, ubicaciones_defecto)
     ingresos_linea_transferidos = _ingresos_transferidos_a_linea(registros, tabla_ubicaciones)
@@ -937,7 +1117,7 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
     }
 
     for ubicacion_key, hoja_nombre in hojas_inv.items():
-        ws = sh.worksheet(hoja_nombre)
+        ws = _obtener_worksheet(SHEET_INVENTARIO, hoja_nombre)
         fila_mes, fila_fechas, fila_headers, fila_datos, fila_fin = _buscar_seccion_mes_inventario(ws, fecha)
         col_destino = _buscar_bloque_fecha_inventario(ws, fila_fechas, fecha)
         if col_destino is None:
@@ -946,8 +1126,14 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
             col_origen = col_destino - 6
         _copiar_bloque_inventario(ws, fila_fechas, fila_headers, fila_datos, fila_fin, col_origen, col_destino)
 
-        productos = ws.col_values(1)
-        cierres_previos = ws.col_values(col_origen + 5)
+        productos = _ejecutar_con_retry_sheets(
+            lambda: ws.col_values(1),
+            operacion=f"leer columna de productos en {_nombre_ws(ws)}",
+        )
+        cierres_previos = _ejecutar_con_retry_sheets(
+            lambda: ws.col_values(col_origen + 5),
+            operacion=f"leer cierres previos en {_nombre_ws(ws)}",
+        )
         rango_bloque = []
 
         for fila in range(fila_datos, fila_fin + 1):
@@ -957,7 +1143,7 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
                 continue
 
             cierre_previo = _parsear_numero(cierres_previos[fila - 1] if fila - 1 < len(cierres_previos) else "")
-            registro = registros.get(ubicacion_key, {}).get(insumo, {})
+            registro = _obtener_valor_mapa(registros.get(ubicacion_key, {}), insumo, {})
             rango_bloque.append(
                 _fila_inventario_para_insumo(
                     ubicacion_key=ubicacion_key,
@@ -973,16 +1159,19 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
                 )
             )
 
-        ws.batch_update([
-            {
-                "range": f"{gspread.utils.rowcol_to_a1(fila_headers, col_destino)}:{gspread.utils.rowcol_to_a1(fila_headers, col_destino + 5)}",
-                "values": [["INICIO", "INGRESO", "SALIDA", "DIF", "VENTAS", "CIERRE"]],
-            },
-            {
-                "range": gspread.utils.rowcol_to_a1(fila_fechas, col_destino),
-                "values": [[fecha_display]],
-            },
-        ])
+        _ejecutar_con_retry_sheets(
+            lambda: ws.batch_update([
+                {
+                    "range": f"{gspread.utils.rowcol_to_a1(fila_headers, col_destino)}:{gspread.utils.rowcol_to_a1(fila_headers, col_destino + 5)}",
+                    "values": [["INICIO", "INGRESO", "SALIDA", "DIF", "VENTAS", "CIERRE"]],
+                },
+                {
+                    "range": gspread.utils.rowcol_to_a1(fila_fechas, col_destino),
+                    "values": [[fecha_display]],
+                },
+            ]),
+            operacion=f"escribir encabezado de inventario en {_nombre_ws(ws)}",
+        )
         _esperar_despues_de_write()
 
         _batch_update_user_entered(ws, [
@@ -995,12 +1184,15 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
 
 def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado: dict,
                                 registros: dict, ubicaciones_defecto: dict) -> dict[str, list[str]]:
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_INVENTARIO)
+    sh = _abrir_spreadsheet(SHEET_INVENTARIO)
     tabla_ubicaciones = leer_tabla_ubicacion_descuento()
     consumo_por_hoja = _agrupar_consumo_por_hoja(consumo_agrupado, ubicaciones_defecto)
     ingresos_linea_transferidos = _ingresos_transferidos_a_linea(registros, tabla_ubicaciones)
-    objetivos = {insumo.strip() for insumo in insumos if str(insumo).strip()}
+    objetivos = {
+        str(insumo).strip(): str(insumo).strip()
+        for insumo in insumos
+        if str(insumo).strip()
+    }
 
     hojas_inv = {
         "C1": "C1",
@@ -1010,17 +1202,17 @@ def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado
     actualizados = {hoja: [] for hoja in hojas_inv.values()}
 
     for ubicacion_key, hoja_nombre in hojas_inv.items():
-        ws = sh.worksheet(hoja_nombre)
+        ws = _obtener_worksheet(SHEET_INVENTARIO, hoja_nombre)
         col_destino, fila_datos, fila_fin, _, productos, cierres_previos = _contexto_bloque_inventario(ws, fecha)
 
         updates = []
         for fila in range(fila_datos, fila_fin + 1):
             insumo = productos[fila - 1].strip() if fila - 1 < len(productos) else ""
-            if insumo not in objetivos:
+            if not _resolver_clave_mapa(objetivos, insumo):
                 continue
 
             cierre_previo = _parsear_numero(cierres_previos[fila - 1] if fila - 1 < len(cierres_previos) else "")
-            registro = registros.get(ubicacion_key, {}).get(insumo, {})
+            registro = _obtener_valor_mapa(registros.get(ubicacion_key, {}), insumo, {})
             values = _fila_inventario_para_insumo(
                 ubicacion_key=ubicacion_key,
                 row=fila,
@@ -1069,11 +1261,10 @@ def _indices_bloque_inventario(headers: list[str]) -> dict[str, int]:
 
 def verificar_inventario_dia_existe(fecha: str) -> dict[str, bool]:
     """Verifica si la entrada del día existe en cada hoja de inventario."""
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_INVENTARIO)
+    sh = _abrir_spreadsheet(SHEET_INVENTARIO)
     resultado = {}
     for hoja in ("C1", "C2", "LINEA CALIENTE"):
-        ws = sh.worksheet(hoja)
+        ws = _obtener_worksheet(SHEET_INVENTARIO, hoja)
         fila_mes, fila_fechas, fila_headers, fila_datos, fila_fin = _buscar_seccion_mes_inventario(ws, fecha)
         col = _buscar_bloque_fecha_inventario(ws, fila_fechas, fecha)
         resultado[hoja] = col is not None
@@ -1081,12 +1272,11 @@ def verificar_inventario_dia_existe(fecha: str) -> dict[str, bool]:
 
 
 def leer_diferencias_inventario_dia(fecha: str) -> dict[str, list[dict]]:
-    gc = get_client()
-    sh = gc.open_by_key(SHEET_INVENTARIO)
+    sh = _abrir_spreadsheet(SHEET_INVENTARIO)
     diferencias = {}
 
     for hoja in ("C1", "C2", "LINEA CALIENTE"):
-        ws = sh.worksheet(hoja)
+        ws = _obtener_worksheet(SHEET_INVENTARIO, hoja)
         fila_mes, fila_fechas, fila_headers, fila_datos, fila_fin = _buscar_seccion_mes_inventario(ws, fecha)
         col = _buscar_bloque_fecha_inventario(ws, fila_fechas, fecha)
         if col is None:

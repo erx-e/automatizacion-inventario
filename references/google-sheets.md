@@ -196,6 +196,8 @@ Los registros del día se leen usando:
 
 - el total real de filas de la hoja
 - el ancho real de la hoja (`ws.col_count`)
+- coincidencia exacta de insumo cuando existe
+- fallback a coincidencia normalizada cuando solo cambian tildes, mayúsculas o sufijos como `2 unid`
 
 Esto evita perder fechas que queden más a la derecha del rango fijo y elimina el problema de truncar meses largos por un límite tipo `A:Q`.
 
@@ -205,6 +207,7 @@ La tabla se usa para decidir:
 
 - ubicación de descuento por defecto de cada insumo
 - qué salidas de `C1` o `C2` deben entrar como ingresos en `LINEA CALIENTE`
+- y también admite fallback por nombre normalizado cuando el texto no coincide exactamente
 
 ## Verificaciones operativas
 

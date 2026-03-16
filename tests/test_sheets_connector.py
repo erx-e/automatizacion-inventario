@@ -218,6 +218,55 @@ class VentasEsperadasTests(unittest.TestCase):
 
         self.assertEqual(ventas, 2)
 
+    def test_linea_usa_salida_registrada_como_ventas_si_existe(self):
+        consumo_por_hoja = {"C1": {}, "C2": {}, "LINEA": {"JALAPENOS": 3}}
+        registros = {"C1": {}, "C2": {}, "LINEA": {"JALAPENOS": {"salida": 5}}}
+
+        ventas = sheets_connector._ventas_esperadas_para_hoja(
+            "LINEA", "JALAPENOS", consumo_por_hoja, registros, {}
+        )
+
+        self.assertEqual(ventas, 5)
+
+    def test_resuelve_insumo_por_nombre_normalizado_y_sufijo_de_unidad(self):
+        tabla = {"PEPERONI SANDUCHE": {"descuento": "LINEA"}}
+        registros = {
+            "C1": {"PEPERONI SANDUCHE 2 unid": {"salida": 2}},
+            "C2": {},
+            "LINEA": {},
+        }
+        consumo_por_hoja = {"C1": {"PEPERONI SANDUCHE": 0}, "C2": {}, "LINEA": {}}
+
+        ventas = sheets_connector._ventas_esperadas_para_hoja(
+            "C1", "PEPERONI SANDUCHE", consumo_por_hoja, registros, tabla
+        )
+        transferidos = sheets_connector._ingresos_transferidos_a_linea(registros, tabla)
+
+        self.assertEqual(ventas, 2)
+        self.assertEqual(transferidos, {"PEPERONI SANDUCHE 2 unid": 2})
+
+    def test_no_confunde_variantes_distintas_por_gramaje(self):
+        clave = sheets_connector._resolver_clave_mapa(
+            {"FILETE DE POLLO 200 gr": {"salida": 3}},
+            "FILETE DE POLLO 100 gr",
+        )
+
+        self.assertIsNone(clave)
+
+    def test_agrupar_consumo_por_hoja_usa_ubicacion_por_nombre_normalizado(self):
+        consumo_agrupado = {
+            "PEPERONI SANDUCHE 2 unid": {
+                "total": 2,
+                "unidad": "UND",
+                "ubicacion": "C1",
+            }
+        }
+        ubicaciones = {"PEPERONI SANDUCHE": "LINEA"}
+
+        agrupado = sheets_connector._agrupar_consumo_por_hoja(consumo_agrupado, ubicaciones)
+
+        self.assertEqual(agrupado["LINEA"]["PEPERONI SANDUCHE 2 unid"], 2)
+
 
 class VentasNeolaHelpersTests(unittest.TestCase):
     def test_agrupa_ventas_repetidas_por_plato(self):
@@ -428,7 +477,7 @@ class InventarioHelpersTests(unittest.TestCase):
 
         self.assertEqual(
             fila,
-            [6, 12, "=R5C1+R5C2-R5C6-R5C5", "=0", 7, 9],
+            [6, 12, "=R5C1+R5C2-R5C6-R5C5", "=0", 2, 14],
         )
 
 
@@ -447,6 +496,81 @@ class UserEnteredWriteTests(unittest.TestCase):
         sheets_connector._batch_update_user_entered(ws, payload)
 
         self.assertEqual(ws.calls, [{"data": payload, "raw": False}])
+
+
+class CorregirInventarioInsumosTests(unittest.TestCase):
+    def test_corrige_insumos_objetivo_con_sufijos_en_filas_de_inventario(self):
+        class Worksheet:
+            def __init__(self, title):
+                self.title = title
+                self.id = 1
+
+        hojas = {
+            "C1": Worksheet("C1"),
+            "C2": Worksheet("C2"),
+            "LINEA CALIENTE": Worksheet("LINEA CALIENTE"),
+        }
+        sh = types.SimpleNamespace(worksheet=lambda hoja_nombre: hojas[hoja_nombre])
+        gc = types.SimpleNamespace(open_by_key=lambda key: sh)
+        productos = [
+            "INSUMO",
+            "KLOBASA DE PRAGA (6 unidad, 500 gr)",
+            "SALCHICHA JALAPENO (5 unidad, 500 gr)",
+            "OTRO INSUMO",
+        ]
+        cierres = ["", "10", "8", "5"]
+        writes = []
+
+        def contexto(ws, fecha):
+            return 7, 2, 4, 1, productos, cierres
+
+        def batch_update(ws, data):
+            writes.append({
+                "hoja": ws.title,
+                "ranges": [item["range"] for item in data],
+            })
+
+        with mock.patch.object(sheets_connector, "get_client", return_value=gc), mock.patch.object(
+            sheets_connector,
+            "leer_tabla_ubicacion_descuento",
+            return_value={},
+        ), mock.patch.object(
+            sheets_connector,
+            "_contexto_bloque_inventario",
+            side_effect=contexto,
+        ), mock.patch.object(
+            sheets_connector,
+            "_fila_inventario_para_insumo",
+            side_effect=lambda **kwargs: [kwargs["insumo"], "", "", "", "", ""],
+        ), mock.patch.object(
+            sheets_connector,
+            "_batch_update_user_entered",
+            side_effect=batch_update,
+        ):
+            actualizados = sheets_connector.corregir_inventario_insumos(
+                "2026-03-14",
+                ["KLOBASA DE PRAGA", "SALCHICHA JALAPENO"],
+                {},
+                {"C1": {}, "C2": {}, "LINEA": {}},
+                {},
+            )
+
+        for hoja in ("C1", "C2", "LINEA CALIENTE"):
+            self.assertEqual(
+                actualizados[hoja],
+                [
+                    "KLOBASA DE PRAGA (6 unidad, 500 gr)",
+                    "SALCHICHA JALAPENO (5 unidad, 500 gr)",
+                ],
+            )
+        self.assertEqual(
+            writes,
+            [
+                {"hoja": "C1", "ranges": ["R2C7:R2C12", "R3C7:R3C12"]},
+                {"hoja": "C2", "ranges": ["R2C7:R2C12", "R3C7:R3C12"]},
+                {"hoja": "LINEA CALIENTE", "ranges": ["R2C7:R2C12", "R3C7:R3C12"]},
+            ],
+        )
 
 
 if __name__ == "__main__":
