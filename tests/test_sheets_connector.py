@@ -187,8 +187,8 @@ class ParsearRegistroRowsTests(unittest.TestCase):
 
 
 class LeerRegistroDiaTests(unittest.TestCase):
-    def test_lee_toda_la_hoja_sin_limitar_a_q(self):
-        ws = types.SimpleNamespace(row_count=200)
+    def test_lee_hasta_el_ancho_real_de_la_hoja(self):
+        ws = types.SimpleNamespace(row_count=200, col_count=42)
         sh = types.SimpleNamespace(worksheet=lambda hoja_nombre: ws)
         gc = types.SimpleNamespace(open_by_key=lambda key: sh)
 
@@ -199,7 +199,10 @@ class LeerRegistroDiaTests(unittest.TestCase):
         ) as leer_mock:
             sheets_connector.leer_registro_dia("REGISTRO C1", "2026-03-10")
 
-        self.assertEqual(leer_mock.call_args.args, (ws,))
+        self.assertEqual(
+            leer_mock.call_args.args,
+            (ws, f"A1:{gspread_stub.utils.rowcol_to_a1(200, 42)}"),
+        )
         self.assertEqual(leer_mock.call_args.kwargs, {})
 
 
@@ -313,6 +316,46 @@ class VentasNeolaHelpersTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "soporta hasta 6 por plato"):
             sheets_connector._construir_filas_ventas_neola("2026-03-13", ventas, consumo)
+
+    def test_agrega_columnas_si_ventas_neola_aun_esta_en_a_k(self):
+        ventas = [
+            {"plato": "TABLA MIXTA", "cantidad": 1, "precio_total": 20.00},
+        ]
+        consumo = [
+            {"plato": "TABLA MIXTA", "insumo": f"INSUMO {idx}", "cantidad_total": idx}
+            for idx in range(1, 7)
+        ]
+        rows_to_write = sheets_connector._construir_filas_ventas_neola("2026-03-13", ventas, consumo)
+
+        class Worksheet:
+            def __init__(self):
+                self.row_count = 10
+                self.col_count = 11
+                self.id = 123
+                self.add_cols_calls = []
+
+            def add_cols(self, amount):
+                self.add_cols_calls.append(amount)
+                self.col_count += amount
+
+            def update(self, range_name, values):
+                return None
+
+        ws = Worksheet()
+        sh = types.SimpleNamespace(worksheet=lambda hoja_nombre: ws, batch_update=lambda payload: None)
+        gc = types.SimpleNamespace(open_by_key=lambda key: sh)
+
+        with mock.patch.object(sheets_connector, "get_client", return_value=gc), mock.patch.object(
+            sheets_connector,
+            "_leer_valores_hoja",
+            side_effect=[
+                [[""] * sheets_connector.COLUMNAS_VENTAS_NEOLA for _ in range(ws.row_count)],
+                rows_to_write,
+            ],
+        ):
+            sheets_connector.escribir_ventas_neola("2026-03-13", ventas, consumo)
+
+        self.assertEqual(ws.add_cols_calls, [4])
 
 
 class InventarioHelpersTests(unittest.TestCase):

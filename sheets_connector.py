@@ -272,7 +272,10 @@ def leer_registro_dia(hoja_nombre: str, fecha: str) -> dict:
     gc = get_client()
     sh = gc.open_by_key(SHEET_REGISTROS)
     ws = sh.worksheet(hoja_nombre)
-    rows = _leer_valores_hoja(ws)
+    rows = _leer_valores_hoja(
+        ws,
+        f"A1:{gspread.utils.rowcol_to_a1(ws.row_count, ws.col_count)}",
+    )
     return _parsear_registro_rows(rows, fecha)
 
 
@@ -478,6 +481,10 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
     ws = sh.worksheet(HOJA_VENTAS_NEOLA)
     ventas_agrupadas = _agrupar_ventas_neola(ventas)
     rows_to_write = _construir_filas_ventas_neola(fecha, ventas, consumo)
+
+    if ws.col_count < COLUMNAS_VENTAS_NEOLA:
+        ws.add_cols(COLUMNAS_VENTAS_NEOLA - ws.col_count)
+        _esperar_despues_de_write()
 
     all_values = _leer_valores_hoja(
         ws,
