@@ -11,8 +11,11 @@ python3 -m unittest discover -s tests -v
 # CLI — Opción 1 (con foto de ticket)
 python3 main.py <imagen> --preparar                         # Preview cierre
 python3 main.py <imagen> --preparar --fecha 2026-03-11      # Preview con fecha
+python3 main.py <imagen> --preparar --precierre             # Marcar ticket como precierre
 python3 main.py <imagen> --solo-ventas                      # Solo cargar ventas a entrada existente
 python3 main.py <imagen> --solo-ventas --confirmar           # Confirmar carga de ventas
+python3 main.py <imagen> --actualizar-ticket                # Comparar ticket nuevo contra ventas actuales
+python3 main.py <imagen> --actualizar-ticket --confirmar     # Aplicar actualización por ticket
 python3 main.py <imagen> --solo-leer                        # Solo parsear ticket
 python3 main.py <imagen> --consumo                          # Solo consumo teórico
 python3 main.py <imagen> --fecha YYYY-MM-DD                 # Cierre directo
@@ -23,6 +26,10 @@ python3 main.py <imagen> --preparar-correccion "POLLO 200 gr"   # Preview correc
 python3 main.py --solo-registros                            # Preview inventario desde registros
 python3 main.py --solo-registros --fecha 2026-03-11         # Con fecha
 python3 main.py --solo-registros --confirmar                # Confirmar escritura
+
+# CLI — Ajustes manuales de ventas
+python3 main.py --ajustar-ventas "NACHOS:+1,LOMO:-2" --fecha 2026-03-11
+python3 main.py --ajustar-ventas "NACHOS:+1,LOMO:-2" --fecha 2026-03-11 --confirmar
 ```
 
 ## Stack
@@ -69,8 +76,10 @@ Foto ticket → [parser_neola + Claude] → ventas JSON
 ### Business rules (critical — read references/ before changing)
 - **Fecha automática:** 19:00-23:59 → hoy (cierre del día); 00:00-03:59 → ayer (cierre tardío); 04:00-18:59 → hoy (caso inusual, asumimos hoy).
 - **ROLLITOS RELLENO:** ambiguo, requiere resolución pollo/queso antes del cierre. Se resuelve vía REGISTRO C2 o override manual.
+- **Precierre:** si el usuario lo indica, el ticket puede marcarse como `precierre`; luego otro ticket o un ajuste manual puede completar solo las diferencias.
 - **ENSALADA CAESAR sin proteína:** default a pollo, siempre explicitado en preview.
 - **Match de recetas:** solo exacto sobre nombre corto normalizado. Si no hay match, sugerir la más similar y bloquear hasta confirmar. Nunca `startswith` automático.
+- **Actualizaciones:** un ticket nuevo o un ajuste textual deben comparar contra las ventas actuales del día y recalcular solo los insumos afectados del inventario.
 - **Panes en LINEA CALIENTE:** no se cuentan diariamente — conteo vacío ≠ 0.
 - **Transferencias a línea:** salidas de C1/C2 con `DESCUENTO POR DEFECTO = LINEA` → INGRESO en LINEA CALIENTE.
 - **Inventario C1/C2:** CIERRE = INICIO + INGRESO - SALIDA; DIF = SALIDA - VENTAS.

@@ -1,125 +1,143 @@
 ---
 name: motor-inventario-sambo
-description: Procesa cierres diarios de Sambó a partir de una foto del cierre o preventa de Neola: hace preview de platos e insumos, confirma fecha, escribe ventas en VENTAS NEOLA y actualiza el inventario diario de C1, C2 y LINEA CALIENTE usando recetas, registros, transferencias a línea y reglas especiales de panes, reutilizando el bloque del día si ya existe. Al final reporta las diferencias reales del bloque escrito y permite correcciones puntuales por insumo sin reescribir todo el inventario diario.
+description: Usa este skill cuando el usuario de Sambó quiera procesar una foto de cierre, precierre o preventa de Neola; crear el inventario diario solo con registros; cargar o actualizar ventas de un día ya existente; o ajustar ventas manualmente por texto. El flujo siempre hace preview, pide confirmación humana y luego actualiza Google Sheets.
 ---
 
-# Motor de Inventario — Restaurante Sambó
+# Motor de Inventario — Sambó
 
-Usa este skill cuando el usuario quiera procesar una foto de cierre/preventa de Neola, revisar platos vendidos, calcular insumos consumidos, aplicar el cierre a Google Sheets, rehacer un día ya existente o corregir la lógica del motor.
+## Objetivo
 
-## Qué leer
-- Este archivo para el flujo normal del skill.
-- `references/flujo-operativo.md` antes de tocar reglas de negocio, inventario o descuadres.
-- `references/google-sheets.md` antes de modificar cómo se ubica o escribe una nueva entrada en Google Sheets.
+Operar el cierre diario de Sambó desde Telegram. El usuario habla en lenguaje natural; tú eliges el flujo correcto y lo traduces al comando CLI adecuado.
 
-## Canal y tono
+## Lee solo lo necesario
 
-El usuario final es personal del Restaurante Sambó que interactúa a través de un bot de Telegram.
+- Este archivo: siempre.
+- `references/flujo-operativo.md`: antes de tocar reglas de negocio, recetas, ventas, inventario o diferencias.
+- `references/google-sheets.md`: solo si vas a cambiar cómo se ubica o escribe un bloque en Google Sheets.
 
-### Reglas de comunicación
-- **Lenguaje natural y directo.** No usar jerga técnica, flags de CLI ni nombres de archivos. El usuario no sabe qué es `--rollitos-pollo` ni `VENTAS NEOLA`.
-- **Mensajes cortos y claros.** Telegram es chat — no mandar párrafos largos. Separar en mensajes si es necesario.
-- **Emojis moderados** para distinguir secciones, pero sin exceso.
-- **No mencionar** nombres de hojas internas (`C1`, `C2`, `LINEA CALIENTE`) salvo en el reporte final de diferencias.
-- **No pedir formatos técnicos.** En vez de "fecha YYYY-MM-DD", preguntar "¿Para qué día es este cierre?" y aceptar respuestas como "hoy", "ayer", "11 de marzo".
-- **Confirmaciones simples.** "¿Todo bien? ¿Procedo?" — no instrucciones con comillas ni flechas.
+## Usa este skill cuando
 
-## Opciones disponibles
+- el usuario manda una foto de ticket, cierre, precierre o preventa de Neola
+- pide "solo registros", "crear entradas del día", "subir ventas", "actualizar cierre", "faltó vender", "súmale" o "réstale"
+- quiere corregir ventas o inventario de un día ya escrito
 
-El motor tiene tres caminos principales:
+## Contrato de conversación
 
-| Opción | Qué hace | Requiere foto | Requisito previo |
-|--------|----------|---------------|------------------|
-| **1A — Cierre completo** | Parsea ticket + preview + escribe ventas e inventario | Sí | Ninguno |
-| **1B — Solo preview** | Parsea ticket + preview (sin escribir) | Sí | Ninguno |
-| **1C — Solo cargar ventas** | Parsea ticket + carga ventas a entrada existente | Sí | Entrada creada con Opción 2 |
-| **2 — Inventario desde registros** | Crea entradas del día usando solo registros | No | Registros del día deben existir |
+- Habla como bot de Telegram: corto, claro y sin jerga técnica.
+- No menciones flags, archivos ni nombres de hojas internas salvo que el usuario lo pida.
+- No pidas formatos técnicos. Acepta fechas como "hoy", "ayer" o "11 de marzo" y conviértelas tú.
+- Nunca escribas en Sheets sin preview y confirmación humana.
+- Si el comando ya imprimió un resumen, igual reescríbelo de forma legible para el usuario.
+- Si algo bloquea el flujo, explica solo el problema operativo y la siguiente acción.
 
-El flujo típico de dos pasos es: primero Opción 2 (crear entradas desde registros), luego Opción 1C (cargar ventas del ticket).
+## Árbol de decisión
 
----
+1. Si hay foto y el usuario quiere revisar antes de escribir: usa la Opción 1A.
+2. Si hay foto y el usuario quiere cierre completo del día: usa la Opción 1A y luego confirma.
+3. Si hay foto y el inventario del día ya existe pero faltan cargar ventas: usa la Opción 1C.
+4. Si hay foto, el día ya tiene ventas y llegó un ticket más completo: usa la Opción 1D.
+5. Si no hay foto y el usuario quiere crear el día desde registros: usa la Opción 2.
+6. Si no hay foto y el usuario describe cambios puntuales de ventas: usa la Opción 3.
+7. Si el usuario solo quiere leer el ticket o ver consumo teórico: usa los comandos auxiliares.
 
-## Opción 1: Cierre desde ticket (foto)
+## Cómo detectar `precierre`
 
-### Paso 1: preparar preview
-Siempre empezar con preview. No escribir en Sheets todavía.
+Marca `precierre` si el usuario dice cosas como:
+
+- "es un precierre"
+- "faltan mesas por cerrar"
+- "aún no han cerrado algunas cuentas"
+- "todavía hay clientes abiertos"
+- "este ticket está incompleto por ahora"
+
+Si el usuario no lo menciona, no lo preguntes por defecto.
+
+## Mapa de comandos
+
+### Opción 1A. Foto -> preview o cierre completo
+
+Usa este flujo cuando llega una foto y todavía no has escrito el día.
+
+Preparación:
 
 ```bash
 cd {baseDir}
 python3 main.py /ruta/a/imagen.jpg --preparar
 python3 main.py /ruta/a/imagen.jpg --preparar --fecha 2026-03-11
-python3 main.py /ruta/a/imagen.jpg --preparar --fecha 2026-03-11 --rollitos-pollo 1 --rollitos-queso 1
+python3 main.py /ruta/a/imagen.jpg --preparar --precierre
+python3 main.py /ruta/a/imagen.jpg --preparar --rollitos-pollo 1 --rollitos-queso 1
 ```
 
-El preview debe mostrar:
-- fecha sugerida o fecha pedida por el usuario
-- platos vendidos
-- debajo de cada plato, sus insumos consumidos con sangría
-- si un plato no genera insumos: `Motivo: ...`
-- al final, total simple por insumo
+Confirmación:
 
-**Después de correr `--preparar`, SIEMPRE enviar el preview completo y formateado al usuario antes de pedir confirmación.** No asumir que el usuario ya lo vio en el output del comando. Reformatear el output del comando para que sea legible en Telegram:
-1. Fecha del cierre
-2. Cada plato con sus insumos (o motivo si no genera insumos)
-3. Total por insumo
-4. Alertas si las hay
-5. Solo después de mostrar todo esto, preguntar si confirma con una pregunta simple ("¿Todo bien? ¿Procedo con el cierre?")
-
-### Paso 2: esperar confirmación
-- Si el usuario dice `si`, `dale`, `confirmar`, `ok` o equivalente: ejecutar el cierre.
-- Si el usuario indica otra fecha (en cualquier formato): confirmar usando esa fecha.
-- Si responde `no`, `cancelar` o equivalente: no escribir nada.
-
-### Paso 3: confirmar cierre
 ```bash
+cd {baseDir}
 python3 main.py /ruta/a/imagen.jpg --fecha 2026-03-11
 ```
 
-Sin `--preparar`, el comando ejecuta el cierre completo.
+### Opción 1B. Solo leer ticket o ver consumo
 
-### Paso 4: revisar diferencias finales
-Después de escribir, el output por defecto muestra las diferencias reales finales del bloque del día agrupadas por C1, C2 y LINEA CALIENTE.
+```bash
+cd {baseDir}
+python3 main.py /ruta/a/imagen.jpg --solo-leer
+python3 main.py /ruta/a/imagen.jpg --consumo
+python3 main.py /ruta/a/imagen.jpg --consumo --usar-registros-rollitos
+```
 
-Reformatear el reporte para Telegram de forma clara:
-- Si no hay diferencias: "✅ Todo cuadra, sin diferencias."
-- Si hay diferencias: listar cada insumo con su descuadre de forma legible, sin la línea completa de INICIO/INGRESO/SALIDA/etc. salvo que el usuario lo pida.
-- Preguntar si quiere corregir algo.
+### Opción 1C. Cargar ventas sobre un día ya creado
 
-### Lógica de fecha automática:
-Los cierres de caja normalmente se procesan de noche. La lógica es:
-- **19:00 a 23:59** → fecha de **hoy** (cierre del día que acaba de terminar)
-- **00:00 a 03:59** → fecha de **ayer** (cierre tardío, corresponde al día anterior)
-- **04:00 a 18:59** → fecha de **hoy** (caso inusual/atrasado, asumimos el día actual)
-- Si el usuario indica fecha, se usa esa sin importar la hora
-- **Siempre mostrar la fecha sugerida al usuario y esperar confirmación antes de proceder**, incluso si se calculó automáticamente.
+Usa este flujo cuando el inventario del día ya fue creado con registros y ahora llegó el ticket.
 
-### Paso 1C: Solo cargar ventas (entrada ya existe)
-
-Si el usuario ya creó la entrada del día con la Opción 2 y ahora quiere cargar las ventas del ticket:
+Preparación:
 
 ```bash
 cd {baseDir}
 python3 main.py /ruta/a/imagen.jpg --solo-ventas
 python3 main.py /ruta/a/imagen.jpg --solo-ventas --fecha 2026-03-11
+python3 main.py /ruta/a/imagen.jpg --solo-ventas --precierre
 python3 main.py /ruta/a/imagen.jpg --solo-ventas --rollitos-pollo 1 --rollitos-queso 1
 ```
 
-Si la entrada del día **no existe** en alguna hoja, el comando lo indica y pide crear la entrada primero (Opción 2).
+Confirmación:
 
-El preview muestra los mismos platos e insumos que el cierre completo, pero aclara que **solo se actualizarán las VENTAS** (la entrada ya tiene INICIO, INGRESO y SALIDA de los registros).
-
-Después de mostrar el preview, preguntar: "¿Cargo las ventas?"
-
-Para confirmar:
 ```bash
+cd {baseDir}
 python3 main.py /ruta/a/imagen.jpg --solo-ventas --confirmar
 ```
 
----
+Si el día no existe todavía, no intentes forzarlo: primero usa la Opción 2.
 
-## Opción 2: Inventario solo desde registros (sin foto)
+### Opción 1D. Actualizar con ticket nuevo
 
-El usuario pide crear las entradas del día usando únicamente los registros de la hoja de registros. No se necesita foto de ticket.
+Usa este flujo cuando ya había ventas cargadas y llega un ticket más completo del mismo día.
+
+Preparación:
+
+```bash
+cd {baseDir}
+python3 main.py /ruta/a/imagen.jpg --actualizar-ticket
+python3 main.py /ruta/a/imagen.jpg --actualizar-ticket --fecha 2026-03-11
+python3 main.py /ruta/a/imagen.jpg --actualizar-ticket --precierre
+```
+
+Confirmación:
+
+```bash
+cd {baseDir}
+python3 main.py /ruta/a/imagen.jpg --actualizar-ticket --confirmar
+```
+
+Regla de uso:
+
+- úsalo para comparar un ticket nuevo contra ventas ya existentes
+- no lo uses para reescribir todo el día si solo cambió una parte
+- si el día estaba marcado antes como `precierre`, recuérdalo en el preview
+
+### Opción 2. Inventario solo desde registros
+
+Usa este flujo cuando todavía no hay ticket final, pero sí existen los registros del día.
+
+Preparación:
 
 ```bash
 cd {baseDir}
@@ -127,127 +145,136 @@ python3 main.py --solo-registros
 python3 main.py --solo-registros --fecha 2026-03-11
 ```
 
-**Requisito:** los registros del día deben existir. Si no hay movimientos registrados, el comando lo indica y pide que se completen primero.
+Confirmación:
 
-El preview muestra:
-- Fecha
-- Movimientos por ubicación (C1, C2, LINEA CALIENTE): ingresos, salidas, conteos
-- Aviso de que VENTAS quedará vacío hasta que se procese el ticket
-
-Después de mostrar el preview, preguntar: "¿Todo correcto? ¿Procedo?"
-
-Para confirmar:
 ```bash
+cd {baseDir}
 python3 main.py --solo-registros --confirmar
 python3 main.py --solo-registros --fecha 2026-03-11 --confirmar
 ```
 
-Después de confirmar, el resultado muestra:
-- Confirmación de que las entradas se crearon
-- Aviso de que VENTAS está vacío y debe procesarse el ticket cuando esté listo
-- Diferencias actuales (que serán altas porque no hay ventas aún)
+Flujo típico:
 
-**Flujo natural en Telegram:**
-- Usuario: "Crea las entradas del día con los registros" o "Solo registros de hoy"
-- Bot: muestra el preview con los movimientos del día
-- Usuario: "Dale" / "Sí" / "Procede"
-- Bot: confirma y muestra resultado
+- primero Opción 2 para crear el día con registros
+- después Opción 1C para cargar las ventas del ticket
 
----
+### Opción 3. Ajuste manual de ventas
 
-### Otros comandos:
+Usa este flujo cuando el usuario no manda foto y describe cambios de ventas por texto.
+
+Preparación:
+
 ```bash
 cd {baseDir}
-python3 main.py /ruta/a/imagen.jpg --solo-leer
-
-python3 main.py /ruta/a/imagen.jpg --consumo
-python3 main.py /ruta/a/imagen.jpg --consumo --usar-registros-rollitos
-python3 main.py /ruta/a/imagen.jpg --fecha 2026-03-13 --corregir-insumos "POLLO 200 gr,CERDO TABLA DE CARNE BBQ 180 gr"
+python3 main.py --ajustar-ventas "NACHOS:+1,LOMO:-2" --fecha 2026-03-11
 ```
 
-Si el usuario pide solo consumo y hay `ROLLITOS RELLENO` ambiguo:
-- mostrar el resto de insumos normalmente
-- dejar `ROLLITOS RELLENO` como pendiente de confirmar
-- preguntar al usuario de forma natural: "Los rollitos, ¿cuántos fueron de pollo y cuántos de queso?"
-- no consultar registros de entradas o salidas para resolverlo
-- cuando el usuario lo aclare (ej: "2 de pollo y 1 de queso"), volver a correr con `--rollitos-pollo N --rollitos-queso N`
+Confirmación:
 
-Solo si el usuario pide explícitamente revisar registros para resolver rollitos:
-- usar `--usar-registros-rollitos`
-- consultar `REGISTRO C2`
-- si cuadra, convertirlos a pollo/queso y agregarlos al consumo
-- si no cuadra, dejar la advertencia correspondiente
+```bash
+cd {baseDir}
+python3 main.py --ajustar-ventas "NACHOS:+1,LOMO:-2" --fecha 2026-03-11 --confirmar
+```
 
-Si aparece `ENSALADA CAESAR` sin proteína explícita:
-- tomarla por defecto como `ENSALADA CÉSAR (POLLO)`
-- reflejar ese supuesto en el preview y en el consumo
-- solo usar otra proteína si el usuario la indica explícitamente
+Convierte lenguaje natural a deltas firmados:
 
-Si el plato del ticket no tiene match exacto en el nombre corto de recetas:
-- no aplicar una receta por prefijo o fragmento
-- buscar la receta más similar y mostrársela al usuario como confirmación
-- preguntar de forma natural, por ejemplo:
-  "En las recetas tenemos 'TABLA QUESOS EMB' pero en el ticket sale 'TABLA DE QUESOS'. ¿Es el mismo plato? Si confirmas, actualizo el nombre."
-- bloquear el cierre hasta que esa receta quede confirmada
+- "faltó 1 nachos" -> `NACHOS:+1`
+- "súmale 2 lomos" -> `LOMO:+2`
+- "réstale 1 ensalada" -> `ENSALADA:-1`
+- "se contó de más 1 hamburguesa" -> `HAMBURGUESA:-1`
+
+Si una frase no deja claro si se suma o se resta, haz una sola pregunta corta antes de continuar.
+
+## Preview obligatorio
+
+### Para Opción 1A y Opción 1C
+
+Siempre muestra, en este orden:
+
+1. fecha del cierre
+2. si aplica, aviso de `precierre`
+3. cada plato vendido
+4. debajo de cada plato, sus insumos o el motivo por el que no descuenta
+5. total por insumo
+6. alertas
+7. una pregunta simple de confirmación
+
+Si es Opción 1C, aclara que solo se actualizarán las ventas del día.
+
+### Para Opción 1D y Opción 3
+
+Siempre muestra, en este orden:
+
+1. fecha del día
+2. si el día ya estaba marcado como `precierre`
+3. si el nuevo cambio también quedará marcado como `precierre`
+4. solo el delta detectado o pedido
+5. cómo quedarán las ventas finales del día
+6. qué insumos se recalcularán
+7. alertas
+8. una pregunta simple de confirmación
+
+Regla clave:
+
+- el preview incremental debe enseñar solo lo que cambia
+- no vuelvas a listar como novedad ventas que ya estaban correctas
+
+### Para Opción 2
+
+Siempre muestra:
+
+1. fecha
+2. movimientos del día por ubicación
+3. aviso de que las ventas todavía quedarán vacías
+4. pregunta simple de confirmación
+
+## Confirmación
+
+- Si el usuario confirma, ejecuta el comando de confirmación.
+- Si cambia la fecha, vuelve a preparar o confirma con la nueva fecha según el flujo.
+- Si cancela, no escribas nada.
+- Después de escribir, siempre devuelve un resumen claro de lo que se hizo y de las diferencias finales.
 
 ## Reglas críticas
-- Si el usuario dio una fecha exacta, usar esa fecha.
-- Si la fecha ya existe en `VENTAS NEOLA` o en el inventario diario, reutilizar ese bloque y sobrescribirlo. No crear una segunda entrada del mismo día.
-- Si la fecha no existe, crear la siguiente entrada dentro del mismo bloque mensual.
-- Los platos ignorados por configuración no descuentan inventario, pero sí deben aparecer en el preview con `Motivo: Plato ignorado por configuración`.
-- `ROLLITOS RELLENO` no se descuenta como ambiguo. Primero hay que resolver si fue pollo o queso.
-- `ENSALADA CAESAR` sin proteína se toma por defecto como pollo, y eso debe quedar explícito en el preview.
-- El match de recetas debe ser exacto sobre el nombre corto normalizado; no usar `startswith` ni fragmentos para aplicar recetas automáticamente.
-- Si varias recetas comparten el mismo nombre corto y su firma inventariable es idéntica, tratarlas como una sola receta.
-- Ejemplo: `HAMBURGUESA GOLDEN` y `HAMBURGUESA GOLDEN PLUS` descuentan la misma receta y no deben duplicar insumos.
-- Si no hay match exacto, proponer la receta más similar y pedir confirmación antes de seguir.
-- Para resolver `ROLLITOS RELLENO`, revisar `REGISTRO C2`:
-  - `CREPE POLLO 2 unid`
-  - `CREPE QUESO 2 unid`
-- Si la suma de salidas coincide con la venta de rollitos, convertir la venta a `ROLLITOS RELLENO POLLO` y/o `ROLLITOS RELLENO QUESO`.
-- Si no coincide o no hay registro suficiente, bloquear el cierre y pedir aclaración al usuario.
-- Si el usuario aclara manualmente, usar `--rollitos-pollo N --rollitos-queso N`.
-- Los panes en `LINEA CALIENTE` no se cuentan diariamente. Si no hay conteo, su cierre se calcula desde el cierre anterior, ingresos, ventas y salidas extraordinarias.
-- Las salidas de `C1` o `C2` cuyo `DESCUENTO POR DEFECTO` sea `LINEA` deben entrar como `INGRESO` en `LINEA CALIENTE`.
-- Al final del cierre, revisar el bloque del día trabajado y confirmar que `DIF` quede en `0` en `C1`, `C2` y `LINEA CALIENTE`, salvo que el usuario quiera conservar una diferencia real.
 
-## Checklist operativo
+- Si el usuario dio una fecha exacta, usa esa fecha.
+- Si la fecha ya existe, reutiliza el bloque del día. Nunca crees un duplicado del mismo día.
+- Si el usuario indica `precierre`, guárdalo como recordatorio del estado del día.
+- Si llega un ticket nuevo o un ajuste manual, compara contra las ventas actuales del día y modifica solo lo que cambió.
+- Después de un ticket nuevo o un ajuste manual, recalcula solo los insumos afectados del inventario.
+- Los platos ignorados por configuración sí deben aparecer en el preview con su motivo, pero no descuentan inventario.
+- Los items con `$0.00` sí cuentan como ventas reales y deben consumir inventario.
+- `ENSALADA CAESAR` sin proteína se toma como pollo y eso debe quedar explícito.
+- El match de recetas es exacto sobre el nombre corto normalizado. No uses `startswith` ni coincidencias parciales automáticas.
+- Si varias recetas comparten el mismo nombre corto y descuentan exactamente lo mismo, trátalas como una sola.
+- Si no hay match exacto, propone la receta más similar y bloquea hasta que el usuario confirme.
+- `ROLLITOS RELLENO` es ambiguo: resuélvelo por registros o por aclaración manual antes de cerrar.
+- Los panes en `LINEA CALIENTE` no se cuentan diariamente; conteo vacío no significa cero.
+- Las transferencias desde `C1` o `C2` hacia línea deben entrar como ingreso en `LINEA CALIENTE`.
 
-### Antes de escribir
-- Confirmar la fecha objetivo.
-- Confirmar que el mes encontrado en la hoja corresponde a esa fecha.
-- Buscar si la fecha exacta ya existe.
-- Si ya existe, reutilizar ese bloque.
-- Si no existe, usar el siguiente bloque vacío del mismo mes.
-- Confirmar que no se va a crear una segunda entrada del mismo día.
-- Revisar el preview de platos e insumos antes de confirmar.
-- Revisar registros del día en `C1`, `C2` y `LINEA CALIENTE`.
-- Si hay `ROLLITOS RELLENO`, revisar primero `CREPE POLLO 2 unid` y `CREPE QUESO 2 unid` en `REGISTRO C2`.
-- Revisar transferencias a línea según `UBICACION DESCUENTO`.
-- Para panes en línea, confirmar si el conteo está vacío. Si está vacío, tratarlos como no contados.
+## Cuándo bloquear y pedir aclaración
 
-### Después de escribir
-- Confirmar que `VENTAS NEOLA` quedó en la fecha correcta.
-- Leer de vuelta el bloque escrito en `VENTAS NEOLA` y verificar que cada plato tenga la cantidad vendida correcta y los insumos correctos según receta.
-- Si la verificación de `VENTAS NEOLA` falla, reescribir automáticamente el bloque exacto desde preview/recetas y volver a verificar.
-- Solo si después de varios intentos el bloque sigue mal, detenerse antes de tocar inventario diario.
-- Confirmar que `C1`, `C2` y `LINEA CALIENTE` quedaron en la fecha correcta.
-- Confirmar que no se duplicó el día.
-- Verificar que `INICIO` del día sale del `CIERRE` anterior.
-- Verificar que ingresos transferidos a línea sí se registraron en `INGRESO`.
-- Verificar que panes sin conteo no quedaron con `conteo = 0`.
-- Verificar que `DIF` del bloque recién trabajado quede en `0`, o reportar explícitamente cualquier diferencia real restante.
+Bloquea el flujo y pide una aclaración corta si ocurre cualquiera de estos casos:
 
-### Correcciones posteriores
-- Si el usuario pide corregir diferencias o errores de registro después del cierre, no reescribir todo el inventario diario.
-- Actualizar solo los insumos pedidos en las hojas afectadas.
-- No volver a tocar `VENTAS NEOLA` salvo que el usuario pida corregir ventas.
-- Después de una corrección puntual, volver a leer las diferencias reales del bloque y reportarlas otra vez por `C1`, `C2` y `LINEA CALIENTE`.
+- el plato no tiene receta confirmada
+- `ROLLITOS RELLENO` sigue ambiguo
+- el usuario quiere Opción 1C, Opción 1D u Opción 3 pero el día todavía no existe
+- el usuario quiere Opción 2 y no hay registros del día
+- el ajuste manual no deja claro si una venta se suma o se resta
+
+## Después de escribir
+
+- Si no hay diferencias, responde: `✅ Todo cuadra, sin diferencias.`
+- Si hay diferencias, lista solo los insumos con su descuadre, salvo que el usuario pida más detalle.
+- Si falla la validación de `VENTAS NEOLA`, corrige ese bloque y vuelve a validar antes de tocar inventario.
+- Si el usuario pide una corrección puntual posterior, no reescribas todo el día: toca solo ventas o insumos afectados.
+- Si llega un ticket más completo después de un `precierre`, muestra solo la diferencia contra lo ya cargado y confirma antes de aplicar.
 
 ## Archivos importantes
-- `main.py`: CLI y flujo interactivo.
-- `motor.py`: preview, confirmación, fecha y resumen.
-- `parser_neola.py`: extracción de ventas desde la foto.
-- `recetas.py`: matching plato-receta y consumo teórico.
-- `sheets_connector.py`: lectura/escritura de Google Sheets.
-- `config.py`: credenciales, hojas, platos ignorados y modelos.
+
+- `main.py`: CLI y selección de flujo.
+- `motor.py`: previews, confirmaciones y lógica incremental.
+- `parser_neola.py`: lectura del ticket.
+- `recetas.py`: match plato-receta y consumo teórico.
+- `sheets_connector.py`: lectura y escritura en Google Sheets.
+- `config.py`: credenciales, constantes y platos ignorados.
