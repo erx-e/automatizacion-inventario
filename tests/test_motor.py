@@ -277,6 +277,48 @@ class ConfirmarCierreTests(unittest.TestCase):
         self.assertIn("C2:", reporte)
         self.assertIn("LINEA CALIENTE:", reporte)
 
+    def test_formato_diferencias_explica_cuando_neola_vende_mas_que_la_salida(self):
+        motor, _ = cargar_motor()
+
+        lineas = motor._formatear_diferencias_inventario({
+            "C1": [{
+                "insumo": "POLLO 200 gr",
+                "inicio": 4,
+                "ingreso": 0,
+                "salida": 0,
+                "dif": -2,
+                "ventas": 2,
+                "cierre": 4,
+            }],
+            "C2": [],
+            "LINEA CALIENTE": [],
+        })
+
+        salida = "\n".join(lineas)
+        self.assertIn("Posible causa:", salida)
+        self.assertIn("Neola reporta ventas, pero no hubo salida registrada", salida)
+
+    def test_formato_diferencias_explica_cuando_hay_salida_sin_venta(self):
+        motor, _ = cargar_motor()
+
+        lineas = motor._formatear_diferencias_inventario({
+            "C1": [],
+            "C2": [],
+            "LINEA CALIENTE": [{
+                "insumo": "PAN DE CERVEZA",
+                "inicio": 10,
+                "ingreso": 0,
+                "salida": 3,
+                "dif": 3,
+                "ventas": 0,
+                "cierre": 7,
+            }],
+        })
+
+        salida = "\n".join(lineas)
+        self.assertIn("Posible causa:", salida)
+        self.assertIn("Hubo salida o uso sin venta en Neola", salida)
+
 
 class RollitosRellenosTests(unittest.TestCase):
     def test_resuelve_rollitos_desde_registro_c2(self):

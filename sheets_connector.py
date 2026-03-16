@@ -941,12 +941,16 @@ def _agrupar_consumo_por_hoja(consumo_agrupado: dict, ubicaciones_defecto: dict)
 
 def _ventas_esperadas_para_hoja(ubicacion_key: str, insumo: str, consumo_por_hoja: dict,
                                 registros: dict, tabla_ubicaciones: dict) -> int:
-    registro_insumo = _obtener_valor_mapa(registros.get(ubicacion_key, {}), insumo, {})
-    salida_registrada = registro_insumo.get("salida", 0) if registro_insumo else 0
-    if salida_registrada:
-        return salida_registrada
+    ventas_neola = _obtener_valor_mapa(consumo_por_hoja.get(ubicacion_key, {}), insumo, 0)
 
-    return _obtener_valor_mapa(consumo_por_hoja.get(ubicacion_key, {}), insumo, 0)
+    if ubicacion_key in ("C1", "C2"):
+        ubicacion = _obtener_valor_mapa(tabla_ubicaciones, insumo, {})
+        descuento = ubicacion.get("descuento") if isinstance(ubicacion, dict) else ""
+        if descuento == "LINEA":
+            registro = _obtener_valor_mapa(registros.get(ubicacion_key, {}), insumo, {})
+            ventas_neola += registro.get("salida", 0) if registro else 0
+
+    return ventas_neola
 
 
 def _ingresos_transferidos_a_linea(registros: dict, tabla_ubicaciones: dict) -> dict[str, int]:

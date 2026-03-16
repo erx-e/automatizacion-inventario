@@ -207,8 +207,8 @@ class LeerRegistroDiaTests(unittest.TestCase):
 
 
 class VentasEsperadasTests(unittest.TestCase):
-    def test_congelador_usa_salida_registrada_como_ventas(self):
-        consumo_por_hoja = {"C1": {}, "C2": {"CREPE POLLO 2 unid": 0}, "LINEA": {}}
+    def test_congelador_usa_consumo_teorico_como_ventas_aun_si_hay_salida_registrada(self):
+        consumo_por_hoja = {"C1": {}, "C2": {"CREPE POLLO 2 unid": 2}, "LINEA": {}}
         registros = {"C1": {}, "C2": {"CREPE POLLO 2 unid": {"salida": 2}}, "LINEA": {}}
         tabla = {"CREPE POLLO 2 unid": {"descuento": "C2"}}
 
@@ -218,7 +218,7 @@ class VentasEsperadasTests(unittest.TestCase):
 
         self.assertEqual(ventas, 2)
 
-    def test_linea_usa_salida_registrada_como_ventas_si_existe(self):
+    def test_linea_usa_consumo_teorico_como_ventas_aun_si_hay_salida_registrada(self):
         consumo_por_hoja = {"C1": {}, "C2": {}, "LINEA": {"JALAPENOS": 3}}
         registros = {"C1": {}, "C2": {}, "LINEA": {"JALAPENOS": {"salida": 5}}}
 
@@ -226,16 +226,16 @@ class VentasEsperadasTests(unittest.TestCase):
             "LINEA", "JALAPENOS", consumo_por_hoja, registros, {}
         )
 
-        self.assertEqual(ventas, 5)
+        self.assertEqual(ventas, 3)
 
-    def test_resuelve_insumo_por_nombre_normalizado_y_sufijo_de_unidad(self):
+    def test_salida_de_congelador_hacia_linea_se_suma_a_ventas_del_congelador(self):
         tabla = {"PEPERONI SANDUCHE": {"descuento": "LINEA"}}
         registros = {
             "C1": {"PEPERONI SANDUCHE 2 unid": {"salida": 2}},
             "C2": {},
             "LINEA": {},
         }
-        consumo_por_hoja = {"C1": {"PEPERONI SANDUCHE": 0}, "C2": {}, "LINEA": {}}
+        consumo_por_hoja = {"C1": {}, "C2": {}, "LINEA": {"PEPERONI SANDUCHE 2 unid": 2}}
 
         ventas = sheets_connector._ventas_esperadas_para_hoja(
             "C1", "PEPERONI SANDUCHE", consumo_por_hoja, registros, tabla
@@ -244,6 +244,25 @@ class VentasEsperadasTests(unittest.TestCase):
 
         self.assertEqual(ventas, 2)
         self.assertEqual(transferidos, {"PEPERONI SANDUCHE 2 unid": 2})
+
+    def test_congelador_suma_transferencia_y_ventas_neola_si_descuenta_en_linea(self):
+        tabla = {"FILETE DE POLLO 200 gr": {"descuento": "LINEA"}}
+        registros = {
+            "C1": {"FILETE DE POLLO 200 gr": {"salida": 5}},
+            "C2": {},
+            "LINEA": {},
+        }
+        consumo_por_hoja = {
+            "C1": {},
+            "C2": {},
+            "LINEA": {"FILETE DE POLLO 200 gr": 3},
+        }
+
+        ventas = sheets_connector._ventas_esperadas_para_hoja(
+            "C1", "FILETE DE POLLO 200 gr", consumo_por_hoja, registros, tabla
+        )
+
+        self.assertEqual(ventas, 5)
 
     def test_no_confunde_variantes_distintas_por_gramaje(self):
         clave = sheets_connector._resolver_clave_mapa(
@@ -477,7 +496,7 @@ class InventarioHelpersTests(unittest.TestCase):
 
         self.assertEqual(
             fila,
-            [6, 12, "=R5C1+R5C2-R5C6-R5C5", "=0", 2, 14],
+            [6, 12, "=R5C1+R5C2-R5C6-R5C5", "=0", 7, 9],
         )
 
 

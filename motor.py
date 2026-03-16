@@ -801,6 +801,9 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
                         f"INGRESO={item['ingreso']}, SALIDA={item['salida']}, "
                         f"DIF={signo}{item['dif']}, VENTAS={item['ventas']}, CIERRE={item['cierre']}"
                     )
+                    diagnostico = _diagnosticar_diferencia_inventario(hoja, item)
+                    if diagnostico:
+                        reporte.append(f"     Posible causa: {diagnostico}")
         else:
             reporte.append("\n✅ Sin diferencias finales en C1, C2 y LINEA CALIENTE")
     elif descuadres:
@@ -946,9 +949,60 @@ def _formatear_diferencias_inventario(diferencias: dict) -> list[str]:
                     f"SALIDA={item['salida']}, DIF={signo}{item['dif']}, "
                     f"VENTAS={item['ventas']}, CIERRE={item['cierre']}"
                 )
+                diagnostico = _diagnosticar_diferencia_inventario(hoja, item)
+                if diagnostico:
+                    lineas.append(f"    Posible causa: {diagnostico}")
     else:
         lineas.append("\nSin diferencias en C1, C2 y LINEA CALIENTE.")
     return lineas
+
+
+def _diagnosticar_diferencia_inventario(hoja: str, item: dict) -> str:
+    dif = int(item.get("dif", 0) or 0)
+    ventas = int(item.get("ventas", 0) or 0)
+    salida = int(item.get("salida", 0) or 0)
+
+    if dif == 0:
+        return ""
+
+    if ventas > 0 and salida == 0:
+        if hoja == "LINEA CALIENTE":
+            return (
+                "Neola reporta ventas, pero no hubo rebaja visible en linea. "
+                "Revisa conteo final, faltó registrar una salida o la receta."
+            )
+        return (
+            "Neola reporta ventas, pero no hubo salida registrada. "
+            "Revisa registro de salida, ubicacion del insumo o receta."
+        )
+
+    if salida > 0 and ventas == 0:
+        return (
+            "Hubo salida o uso sin venta en Neola. "
+            "Revisa merma, produccion interna, salida manual o un ticket faltante."
+        )
+
+    if dif > 0:
+        if hoja == "LINEA CALIENTE":
+            return (
+                "Se rebajo mas en linea de lo que Neola vende. "
+                "Revisa conteo final, salidas manuales o una receta cargada de mas."
+            )
+        return (
+            "Se saco mas del congelador de lo que Neola vende. "
+            "Revisa salida registrada, transferencias a linea o receta cargada de mas."
+        )
+
+    if hoja == "LINEA CALIENTE":
+        return (
+            "Neola vende mas de lo rebajado en linea. "
+            "Revisa conteo final, faltó registrar una salida o la receta podria estar incompleta."
+        )
+
+    return (
+        "Neola vende mas de lo sacado del congelador. "
+        "Revisa la salida registrada, la ubicacion del insumo o una venta faltante en el registro."
+    )
 
 
 def _verificar_entrada_inventario(fecha: str) -> tuple[bool, str]:
