@@ -752,7 +752,13 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
 
     if ventas_ok:
         try:
-            escribir_inventario_dia(fecha, consumo_agrupado, registros, ubicaciones_defecto)
+            escribir_inventario_dia(
+                fecha,
+                consumo_agrupado,
+                registros,
+                ubicaciones_defecto,
+                modo_ventas="final_ticket",
+            )
             reporte.append("✅ Inventario diario actualizado")
         except Exception as e:
             reporte.append(f"⚠️ Error al guardar inventario: {str(e)}")
@@ -1344,7 +1350,8 @@ def preparar_inventario_registros(fecha: str = None) -> dict:
 
     lineas.append(f"\n{'=' * 40}")
     lineas.append(f"Se crearán las entradas del {fecha} en C1, C2 y LINEA CALIENTE.")
-    lineas.append("VENTAS quedará vacío hasta que se procese el ticket.")
+    lineas.append("En C1 y C2, VENTAS provisional se llenará desde SALIDA registrada.")
+    lineas.append("LINEA CALIENTE quedará pendiente del ticket para completar VENTAS.")
     lineas.append("\n¿Todo correcto? ¿Procedo?")
 
     return {
@@ -1357,13 +1364,19 @@ def preparar_inventario_registros(fecha: str = None) -> dict:
 
 
 def confirmar_inventario_registros(preparacion: dict) -> str:
-    """Escribe el inventario del día usando solo registros. VENTAS = 0."""
+    """Escribe el inventario del día usando solo registros con ventas provisionales."""
     fecha = preparacion["fecha"]
     registros = preparacion["registros"]
     ubicaciones = preparacion["ubicaciones"]
 
     try:
-        escribir_inventario_dia(fecha, {}, registros, ubicaciones)
+        escribir_inventario_dia(
+            fecha,
+            {},
+            registros,
+            ubicaciones,
+            modo_ventas="provisional_registros",
+        )
     except Exception as e:
         return f"❌ Error al escribir inventario: {str(e)}"
 
@@ -1374,7 +1387,8 @@ def confirmar_inventario_registros(preparacion: dict) -> str:
 
     lineas = [f"✅ INVENTARIO CREADO — {fecha}"]
     lineas.append("Entradas creadas en C1, C2 y LINEA CALIENTE.")
-    lineas.append("VENTAS está vacío — procesa el ticket cuando esté listo.")
+    lineas.append("C1 y C2 quedaron con VENTAS provisional desde SALIDA registrada.")
+    lineas.append("LINEA CALIENTE sigue pendiente del ticket para completar VENTAS.")
     lineas.extend(_formatear_diferencias_inventario(diferencias))
     return "\n".join(lineas)
 

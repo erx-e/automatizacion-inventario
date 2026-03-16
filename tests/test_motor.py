@@ -96,13 +96,13 @@ def cargar_motor():
         (fecha, ventas, consumo)
     )
     sheets_module.escribir_inventario_dia = (
-        lambda fecha, consumo_agrupado, registros, ubicaciones: state["inventario_writes"].append(
-            (fecha, consumo_agrupado, registros, ubicaciones)
+        lambda fecha, consumo_agrupado, registros, ubicaciones, modo_ventas="final_ticket": state["inventario_writes"].append(
+            (fecha, consumo_agrupado, registros, ubicaciones, modo_ventas)
         )
     )
-    sheets_module.corregir_inventario_insumos = lambda fecha, insumos, consumo_agrupado, registros, ubicaciones: (
+    sheets_module.corregir_inventario_insumos = lambda fecha, insumos, consumo_agrupado, registros, ubicaciones, modo_ventas="final_ticket": (
         state["inventario_corrections"].append(
-            (fecha, insumos, consumo_agrupado, registros, ubicaciones)
+            (fecha, insumos, consumo_agrupado, registros, ubicaciones, modo_ventas)
         ) or {
             "C1": [],
             "C2": [],
@@ -712,7 +712,7 @@ class InventarioRegistrosTests(unittest.TestCase):
         self.assertFalse(prep["ok"])
         self.assertIn("No hay registros", prep["resumen"])
 
-    def test_confirmar_inventario_registros_escribe_con_ventas_vacias(self):
+    def test_confirmar_inventario_registros_escribe_ventas_provisionales_desde_registro(self):
         motor, state = cargar_motor()
         state["registros"] = {
             "C1": {"POLLO 200 gr": {"ingreso": 5, "salida": 2, "motivo": ""}},
@@ -730,11 +730,12 @@ class InventarioRegistrosTests(unittest.TestCase):
 
         self.assertIn("INVENTARIO CREADO", resultado)
         self.assertIn("2026-03-14", resultado)
-        self.assertIn("VENTAS está vacío", resultado)
+        self.assertIn("VENTAS provisional", resultado)
         self.assertEqual(len(state["inventario_writes"]), 1)
-        fecha, consumo, registros, ubicaciones = state["inventario_writes"][0]
+        fecha, consumo, registros, ubicaciones, modo_ventas = state["inventario_writes"][0]
         self.assertEqual(fecha, "2026-03-14")
-        self.assertEqual(consumo, {})  # Ventas vacías
+        self.assertEqual(consumo, {})
+        self.assertEqual(modo_ventas, "provisional_registros")
 
     def test_preparar_inventario_registros_usa_fecha_sugerida(self):
         motor, state = cargar_motor()

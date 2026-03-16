@@ -182,6 +182,60 @@ class PlatosIgnoradosTests(unittest.TestCase):
             ],
         )
 
+    def test_busca_receta_por_alias_neola(self):
+        ventas = [
+            {"plato": "SANDWICH DE PEPE", "cantidad": 2, "precio_total": 18.00},
+        ]
+        recetas_data = [
+            {
+                "plato": "SANDWICH DE PEPP",
+                "nombre_menu": "SANDWICH DE PEPERONI",
+                "nombres_neola": ["SANDWICH DE PEPE", "SANDWICH DE PEPP"],
+                "sku": "EMB-001",
+                "insumo": "PEPERONI SANDUCHE 80 gr 8 unid",
+                "cantidad": 1,
+                "unidad": "PAX",
+                "ubicacion": "C1",
+            },
+            {
+                "plato": "SANDWICH DE PEPP",
+                "nombre_menu": "SANDWICH DE PEPERONI",
+                "nombres_neola": ["SANDWICH DE PEPE", "SANDWICH DE PEPP"],
+                "sku": "PAN-010",
+                "insumo": "PANINI (SANDUCHE- JAMON, PEPERONI)",
+                "cantidad": 1,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+
+        consumo, alertas = recetas.calcular_consumo_teorico(ventas, recetas_data)
+
+        self.assertEqual(alertas, [])
+        self.assertEqual(len(consumo), 2)
+        self.assertEqual({item["insumo"] for item in consumo}, {
+            "PEPERONI SANDUCHE 80 gr 8 unid",
+            "PANINI (SANDUCHE- JAMON, PEPERONI)",
+        })
+
+    def test_sugerencia_considera_aliases_neola(self):
+        recetas_data = [
+            {
+                "plato": "SANDWICH DE PEPP",
+                "nombre_menu": "SANDWICH DE PEPERONI",
+                "nombres_neola": ["SANDWICH DE PEPE", "SANDWICH DE PEPP"],
+                "sku": "EMB-001",
+                "insumo": "PEPERONI SANDUCHE 80 gr 8 unid",
+                "cantidad": 1,
+                "unidad": "PAX",
+                "ubicacion": "C1",
+            },
+        ]
+
+        sugerencia = recetas.sugerir_receta_similar("SANDWICH DE PEP", recetas_data)
+
+        self.assertEqual(sugerencia, "SANDWICH DE PEPP")
+
 
 if __name__ == "__main__":
     unittest.main()

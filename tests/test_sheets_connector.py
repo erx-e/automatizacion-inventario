@@ -56,12 +56,12 @@ import sheets_connector  # noqa: E402
 class ParsearRecetasRowsTests(unittest.TestCase):
     def test_parsea_todos_los_insumos_de_un_plato_con_celdas_combinadas(self):
         rows = [
-            ["PLATO", "MENU", "SKU", "INSUMO", "CANT", "UND", "UBIC", "CONFIRMADO", "NOTAS"],
-            ["nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota"],
-            ["HAMBURGUESA GOLD", "GOLD", "SKU-1", "CARNE 180G", "1", "UND", "C1", "✅", ""],
-            ["", "", "SKU-2", "PAN BRIOCHE", "1", "UND", "LINEA", "✅", ""],
-            ["", "", "SKU-3", "QUESO", "2", "LONJA", "LINEA", "✅", ""],
-            ["PAPAS CHEDDAR", "PAPAS", "", "", "", "", "", "✅", "sin inventario"],
+            ["PLATO", "MENU", "SKU", "INSUMO", "CANT", "UND", "UBIC", "CONFIRMADO", "NOTAS", "NOMBRES NEOLA"],
+            ["nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota"],
+            ["HAMBURGUESA GOLD", "GOLD", "SKU-1", "CARNE 180G", "1", "UND", "C1", "✅", "", "HAMBURGUESA GOLD|HAMBURGUESA G"],
+            ["", "", "SKU-2", "PAN BRIOCHE", "1", "UND", "LINEA", "✅", "", ""],
+            ["", "", "SKU-3", "QUESO", "2", "LONJA", "LINEA", "✅", "", ""],
+            ["PAPAS CHEDDAR", "PAPAS", "", "", "", "", "", "✅", "sin inventario", ""],
         ]
 
         recetas = sheets_connector._parsear_recetas_rows(rows)
@@ -72,14 +72,17 @@ class ParsearRecetasRowsTests(unittest.TestCase):
             ["CARNE 180G", "PAN BRIOCHE", "QUESO"],
         )
         self.assertTrue(all(receta["plato"] == "HAMBURGUESA GOLD" for receta in recetas[:3]))
+        self.assertEqual(recetas[0]["nombres_neola"], ["HAMBURGUESA GOLD", "HAMBURGUESA G"])
+        self.assertEqual(recetas[1]["nombres_neola"], ["HAMBURGUESA GOLD", "HAMBURGUESA G"])
         self.assertEqual(recetas[3]["plato"], "PAPAS CHEDDAR")
         self.assertEqual(recetas[3]["sku"], "")
         self.assertEqual(recetas[3]["insumo"], "")
+        self.assertEqual(recetas[3]["nombres_neola"], [])
 
     def test_ignora_filas_de_categoria_expandidas_por_celdas_combinadas(self):
         rows = [
-            ["PLATO", "MENU", "SKU", "INSUMO", "CANT", "UND", "UBIC", "CONFIRMADO", "NOTAS"],
-            ["nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota"],
+            ["PLATO", "MENU", "SKU", "INSUMO", "CANT", "UND", "UBIC", "CONFIRMADO", "NOTAS", "NOMBRES NEOLA"],
+            ["nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota"],
             [
                 "HAMBURGUESAS Y SANDWICHES",
                 "HAMBURGUESAS Y SANDWICHES",
@@ -90,14 +93,29 @@ class ParsearRecetasRowsTests(unittest.TestCase):
                 "HAMBURGUESAS Y SANDWICHES",
                 "HAMBURGUESAS Y SANDWICHES",
                 "",
+                "",
             ],
-            ["HAMBURGUESA GOLD", "GOLD", "SKU-1", "CARNE 180G", "1", "UND", "C1", "✅", ""],
+            ["HAMBURGUESA GOLD", "GOLD", "SKU-1", "CARNE 180G", "1", "UND", "C1", "✅", "", ""],
         ]
 
         recetas = sheets_connector._parsear_recetas_rows(rows)
 
         self.assertEqual(len(recetas), 1)
         self.assertEqual(recetas[0]["plato"], "HAMBURGUESA GOLD")
+
+    def test_hereda_aliases_neola_en_filas_siguientes_del_mismo_bloque(self):
+        rows = [
+            ["PLATO", "MENU", "SKU", "INSUMO", "CANT", "UND", "UBIC", "CONFIRMADO", "NOTAS", "NOMBRES NEOLA"],
+            ["nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota", "nota"],
+            ["SANDWICH DE PEPP", "SANDWICH DE PEPERONI", "SKU-1", "PEPERONI", "1", "PAX", "C1", "✅", "", "SANDWICH DE PEPE|SANDWICH DE PEPP"],
+            ["", "", "SKU-2", "PANINI", "1", "UND", "LINEA", "✅", "", ""],
+        ]
+
+        recetas = sheets_connector._parsear_recetas_rows(rows)
+
+        self.assertEqual(len(recetas), 2)
+        self.assertEqual(recetas[0]["nombres_neola"], ["SANDWICH DE PEPE", "SANDWICH DE PEPP"])
+        self.assertEqual(recetas[1]["nombres_neola"], ["SANDWICH DE PEPE", "SANDWICH DE PEPP"])
 
 
 class LeerValoresHojaTests(unittest.TestCase):
@@ -207,13 +225,18 @@ class LeerRegistroDiaTests(unittest.TestCase):
 
 
 class VentasEsperadasTests(unittest.TestCase):
-    def test_congelador_usa_consumo_teorico_como_ventas_aun_si_hay_salida_registrada(self):
+    def test_solo_registros_congelador_usa_salida_registrada_como_ventas_provisionales(self):
         consumo_por_hoja = {"C1": {}, "C2": {"CREPE POLLO 2 unid": 2}, "LINEA": {}}
         registros = {"C1": {}, "C2": {"CREPE POLLO 2 unid": {"salida": 2}}, "LINEA": {}}
         tabla = {"CREPE POLLO 2 unid": {"descuento": "C2"}}
 
         ventas = sheets_connector._ventas_esperadas_para_hoja(
-            "C2", "CREPE POLLO 2 unid", consumo_por_hoja, registros, tabla
+            "C2",
+            "CREPE POLLO 2 unid",
+            consumo_por_hoja,
+            registros,
+            tabla,
+            modo_ventas="provisional_registros",
         )
 
         self.assertEqual(ventas, 2)
@@ -228,7 +251,37 @@ class VentasEsperadasTests(unittest.TestCase):
 
         self.assertEqual(ventas, 3)
 
-    def test_salida_de_congelador_hacia_linea_se_suma_a_ventas_del_congelador(self):
+    def test_congelador_en_final_toma_maximo_entre_ticket_y_salida_para_no_duplicar(self):
+        tabla = {"HAMBURGUESA FALAFEL (150 gr)": {"descuento": "C1"}}
+        registros = {
+            "C1": {"HAMBURGUESA FALAFEL (150 gr)": {"salida": 2}},
+            "C2": {},
+            "LINEA": {},
+        }
+        consumo_por_hoja = {"C1": {"HAMBURGUESA FALAFEL (150 gr)": 2}, "C2": {}, "LINEA": {}}
+
+        ventas = sheets_connector._ventas_esperadas_para_hoja(
+            "C1", "HAMBURGUESA FALAFEL (150 gr)", consumo_por_hoja, registros, tabla
+        )
+
+        self.assertEqual(ventas, 2)
+
+    def test_congelador_en_final_detecta_venta_faltante_si_ticket_supera_salida(self):
+        tabla = {"HAMBURGUESA FALAFEL (150 gr)": {"descuento": "C1"}}
+        registros = {
+            "C1": {"HAMBURGUESA FALAFEL (150 gr)": {"salida": 1}},
+            "C2": {},
+            "LINEA": {},
+        }
+        consumo_por_hoja = {"C1": {"HAMBURGUESA FALAFEL (150 gr)": 2}, "C2": {}, "LINEA": {}}
+
+        ventas = sheets_connector._ventas_esperadas_para_hoja(
+            "C1", "HAMBURGUESA FALAFEL (150 gr)", consumo_por_hoja, registros, tabla
+        )
+
+        self.assertEqual(ventas, 2)
+
+    def test_salida_de_congelador_hacia_linea_se_mantiene_como_ventas_del_congelador(self):
         tabla = {"PEPERONI SANDUCHE": {"descuento": "LINEA"}}
         registros = {
             "C1": {"PEPERONI SANDUCHE 2 unid": {"salida": 2}},
@@ -245,7 +298,7 @@ class VentasEsperadasTests(unittest.TestCase):
         self.assertEqual(ventas, 2)
         self.assertEqual(transferidos, {"PEPERONI SANDUCHE 2 unid": 2})
 
-    def test_congelador_suma_transferencia_y_ventas_neola_si_descuenta_en_linea(self):
+    def test_congelador_con_descuento_en_linea_no_duplica_con_ticket(self):
         tabla = {"FILETE DE POLLO 200 gr": {"descuento": "LINEA"}}
         registros = {
             "C1": {"FILETE DE POLLO 200 gr": {"salida": 5}},

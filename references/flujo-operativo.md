@@ -50,7 +50,9 @@ Secuencia:
 2. Mostrar preview de movimientos por ubicación.
 3. Esperar confirmación.
 4. Crear la entrada del día en `C1`, `C2` y `LINEA CALIENTE`.
-5. Dejar `VENTAS` en cero hasta que llegue el ticket.
+5. En `C1` y `C2`, llenar `VENTAS` provisional con la `SALIDA` registrada.
+6. En `LINEA CALIENTE`, dejar `VENTAS` pendiente del ticket final.
+7. Mantener `SALIDA` y `DIF` como fórmulas visibles.
 
 Este flujo prepara el día para luego usar "solo ventas".
 
@@ -178,6 +180,8 @@ Si el usuario no menciona `precierre`, no asumirlo.
 ## Matching de recetas
 
 - Buscar match exacto sobre el nombre corto de Neola normalizado.
+- Si la receta tiene aliases en `RECETAS -> NOMBRES NEOLA`, cualquiera de esos aliases cuenta como match exacto.
+- El nombre canónico vive en `PLATO NEOLA`; los aliases solo sirven para reconocer variantes reales de Neola.
 - No aplicar recetas por `startswith`, fragmentos o coincidencias parciales automáticas.
 - Si varias recetas comparten el mismo nombre corto y tienen la misma firma inventariable, colapsarlas y tratarlas como una sola receta.
 - Ejemplo: `HAMBURGUESA GOLDEN` y `HAMBURGUESA GOLDEN PLUS` no deben duplicar consumo si descuentan lo mismo.
@@ -215,26 +219,39 @@ Excepción:
 - `INICIO` = `CIERRE` del bloque anterior.
 - `INGRESO` = ingreso registrado del día.
 - `SALIDA` = salida registrada del día.
-- `VENTAS`:
-  - usar la salida registrada si existe
-  - si no existe, usar el consumo teórico de recetas
 - `CIERRE` = `INICIO + INGRESO - SALIDA`
 - `DIF` = `SALIDA - VENTAS`
+
+#### En "solo registros"
+
+- `VENTAS_PROVISIONAL = SALIDA registrada`
+- objetivo: dejar reflejadas las salidas reales del congelador sin esperar el ticket
+- si luego entra un ticket, este valor provisional se recalcula y no se debe sumar encima
+
+#### En cierre final o flujos incrementales
+
+- si el insumo se descuenta en el mismo congelador, `VENTAS_FINAL = max(consumo_teórico, SALIDA registrada)`
+- si el insumo se descuenta en `LINEA`, `VENTAS_FINAL = SALIDA registrada`
+- esto permite cubrir:
+  - ventas normales de Neola
+  - salidas directas para preparar un plato
+  - transferencias a línea
+- regla crítica: no duplicar insumos cuando primero hubo salida manual y luego llegó el ticket
 
 En la hoja diaria:
 
 - `SALIDA` se deja escrita como fórmula visible
 - `DIF` se deja escrita como fórmula visible
 
-Esto evita perder ventas registradas manualmente, como `CREPE POLLO 2 unid`.
+Esto evita perder salidas reales del congelador y evita duplicar consumo cuando el ticket se carga después.
 
 ### `LINEA CALIENTE`
 
 - `INGRESO` = ingreso registrado en línea + transferencias desde `C1/C2`.
 - Una transferencia existe cuando un insumo salió de `C1/C2` y en `UBICACION DESCUENTO` su `DESCUENTO POR DEFECTO` es `LINEA`.
 - `VENTAS`:
-  - usar la salida registrada en línea si existe
-  - si no existe, usar el consumo teórico que corresponde a línea
+  - en "solo registros", dejarla pendiente del ticket
+  - en cierre final o flujo incremental, usar el consumo teórico que corresponde a línea
 
 #### Cuando sí hay conteo
 
@@ -278,6 +295,8 @@ En la hoja diaria:
 - En flujos incrementales, primero actualizar `VENTAS NEOLA` y después recalcular inventario.
 - En flujos incrementales, si falla `VENTAS NEOLA`, no tocar inventario.
 - En correcciones puntuales, no reescribir todo el inventario diario.
+- Cuando un día nació con "solo registros", no usar la columna `VENTAS` provisional del inventario como fuente para sumar ventas nuevas.
+- El recálculo final siempre debe salir de `VENTAS NEOLA` + registros + recetas + `UBICACION DESCUENTO`.
 - Al cruzar recetas, registros y `UBICACION DESCUENTO`, intentar primero match exacto y luego un match normalizado para tolerar tildes, mayúsculas y sufijos como `2 unid`.
 
 ## Cuándo bloquear

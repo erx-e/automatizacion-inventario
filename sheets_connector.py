@@ -167,9 +167,24 @@ def _parsear_recetas_rows(rows: list[list[str]]) -> list[dict]:
     recetas = []
     plato_actual = ""
     nombre_actual = ""
+    nombres_neola_actuales = []
+
+    def parsear_nombres_neola(raw: str) -> list[str]:
+        nombres = []
+        vistos = set()
+        for item in re.split(r"[|\n;]+", str(raw or "")):
+            nombre = item.strip()
+            if not nombre:
+                continue
+            clave = _normalizar_nombre_insumo(nombre)
+            if clave in vistos:
+                continue
+            vistos.add(clave)
+            nombres.append(nombre)
+        return nombres
 
     for raw_row in rows[2:]:
-        row = list(raw_row) + [""] * max(0, 9 - len(raw_row))
+        row = list(raw_row) + [""] * max(0, 10 - len(raw_row))
         confirmado = row[7].strip()
 
         # Las filas de categoría o notas quedan "rellenadas" por las celdas
@@ -177,11 +192,19 @@ def _parsear_recetas_rows(rows: list[list[str]]) -> list[dict]:
         if confirmado not in VALORES_CONFIRMACION_RECETA:
             continue
 
-        plato = row[0].strip() or plato_actual
-        nombre = row[1].strip() or nombre_actual
+        plato_raw = row[0].strip()
+        nombre_raw = row[1].strip()
+        nombres_neola_raw = row[9].strip()
 
-        if plato:
-            plato_actual = plato
+        if plato_raw:
+            plato_actual = plato_raw
+            nombres_neola_actuales = parsear_nombres_neola(nombres_neola_raw)
+        elif nombres_neola_raw:
+            nombres_neola_actuales = parsear_nombres_neola(nombres_neola_raw)
+
+        plato = plato_actual
+        nombre = nombre_raw or nombre_actual
+
         if nombre:
             nombre_actual = nombre
 
@@ -202,6 +225,7 @@ def _parsear_recetas_rows(rows: list[list[str]]) -> list[dict]:
         recetas.append({
             "plato": plato_actual,
             "nombre_menu": nombre_actual,
+            "nombres_neola": list(nombres_neola_actuales),
             "sku": sku,
             "insumo": insumo,
             "cantidad": cantidad,
@@ -215,7 +239,10 @@ def _parsear_recetas_rows(rows: list[list[str]]) -> list[dict]:
 def leer_recetas() -> list[dict]:
     if "recetas" not in _master_cache:
         ws = _obtener_worksheet(SHEET_RECETAS, HOJA_RECETAS)
-        rows = _leer_valores_hoja(ws, f"A1:I{ws.row_count}")
+        rows = _leer_valores_hoja(
+            ws,
+            f"A1:{gspread.utils.rowcol_to_a1(ws.row_count, max(ws.col_count, 10))}",
+        )
         _master_cache["recetas"] = _parsear_recetas_rows(rows)
     return _master_cache["recetas"]
 
@@ -940,15 +967,24 @@ def _agrupar_consumo_por_hoja(consumo_agrupado: dict, ubicaciones_defecto: dict)
 
 
 def _ventas_esperadas_para_hoja(ubicacion_key: str, insumo: str, consumo_por_hoja: dict,
-                                registros: dict, tabla_ubicaciones: dict) -> int:
+                                registros: dict, tabla_ubicaciones: dict,
+                                modo_ventas: str = "final_ticket") -> int:
     ventas_neola = _obtener_valor_mapa(consumo_por_hoja.get(ubicacion_key, {}), insumo, 0)
+    registro = _obtener_valor_mapa(registros.get(ubicacion_key, {}), insumo, {})
+    salida_registrada = registro.get("salida", 0) if registro else 0
+
+    if modo_ventas == "provisional_registros":
+        if ubicacion_key in ("C1", "C2"):
+            return salida_registrada
+        return 0
 
     if ubicacion_key in ("C1", "C2"):
         ubicacion = _obtener_valor_mapa(tabla_ubicaciones, insumo, {})
         descuento = ubicacion.get("descuento") if isinstance(ubicacion, dict) else ""
         if descuento == "LINEA":
-            registro = _obtener_valor_mapa(registros.get(ubicacion_key, {}), insumo, {})
-            ventas_neola += registro.get("salida", 0) if registro else 0
+            return salida_registrada
+
+        return max(ventas_neola, salida_registrada)
 
     return ventas_neola
 
@@ -975,6 +1011,7 @@ def _valores_inventario_para_insumo(
     registros: dict,
     tabla_ubicaciones: dict,
     ingresos_linea_transferidos: dict,
+    modo_ventas: str = "final_ticket",
 ) -> list:
     ingreso = registro.get("ingreso", 0)
     if ubicacion_key == "LINEA":
@@ -986,6 +1023,7 @@ def _valores_inventario_para_insumo(
         consumo_por_hoja,
         registros,
         tabla_ubicaciones,
+        modo_ventas,
     )
 
     if ubicacion_key == "LINEA" and registro.get("conteo") is not None:
@@ -1050,6 +1088,7 @@ def _fila_inventario_para_insumo(
     registros: dict,
     tabla_ubicaciones: dict,
     ingresos_linea_transferidos: dict,
+    modo_ventas: str = "final_ticket",
 ) -> list:
     valores = _valores_inventario_para_insumo(
         ubicacion_key,
@@ -1060,6 +1099,7 @@ def _fila_inventario_para_insumo(
         registros,
         tabla_ubicaciones,
         ingresos_linea_transferidos,
+        modo_ventas,
     )
     conteo_presente = ubicacion_key == "LINEA" and registro.get("conteo") is not None
 
@@ -1098,10 +1138,11 @@ def _contexto_bloque_inventario(ws, fecha: str) -> tuple[int, int, int, int, lis
     return col_destino, fila_datos, fila_fin, col_origen, productos, cierres_previos
 
 
-def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict, ubicaciones_defecto: dict):
+def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
+                            ubicaciones_defecto: dict, modo_ventas: str = "final_ticket"):
     """
     Escribe los datos del cierre en las hojas de inventario:
-    - VENTAS (consumo teórico) en la columna VENTAS del día
+    - VENTAS en la columna VENTAS del día
     - INGRESO/SALIDA desde los registros
     - Motivos extraordinarios como comentarios
 
@@ -1160,6 +1201,7 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
                     registros=registros,
                     tabla_ubicaciones=tabla_ubicaciones,
                     ingresos_linea_transferidos=ingresos_linea_transferidos,
+                    modo_ventas=modo_ventas,
                 )
             )
 
@@ -1187,7 +1229,8 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
 
 
 def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado: dict,
-                                registros: dict, ubicaciones_defecto: dict) -> dict[str, list[str]]:
+                                registros: dict, ubicaciones_defecto: dict,
+                                modo_ventas: str = "final_ticket") -> dict[str, list[str]]:
     sh = _abrir_spreadsheet(SHEET_INVENTARIO)
     tabla_ubicaciones = leer_tabla_ubicacion_descuento()
     consumo_por_hoja = _agrupar_consumo_por_hoja(consumo_agrupado, ubicaciones_defecto)
@@ -1228,6 +1271,7 @@ def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado
                 registros=registros,
                 tabla_ubicaciones=tabla_ubicaciones,
                 ingresos_linea_transferidos=ingresos_linea_transferidos,
+                modo_ventas=modo_ventas,
             )
             updates.append({
                 "range": (

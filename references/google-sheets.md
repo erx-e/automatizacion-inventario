@@ -103,6 +103,37 @@ Para leer ventas ya existentes del día:
 
 Esto permite comparar ventas actuales vs ventas nuevas sin depender de rangos fijos cortos.
 
+## `RECETAS`
+
+### Columna opcional para nombres de Neola
+
+La hoja `RECETAS` ahora admite una columna opcional adicional al final:
+
+- `NOMBRES NEOLA`
+
+Objetivo:
+
+- permitir que una misma receta responda a varios nombres equivalentes usados por Neola
+- absorber problemas de estandarización como abreviaciones, recortes o variantes históricas
+
+Ejemplo:
+
+- receta canónica: `SANDWICH DE PEPE`
+- `NOMBRES NEOLA`: `SANDWICH DE PEPE | SANDWICH DE PEPP`
+
+Reglas:
+
+- el motor sigue usando `PLATO` como nombre canónico interno de la receta
+- `NOMBRES NEOLA` se usa solo para reconocer nombres alternativos al leer el ticket
+- se pueden separar aliases con `|`
+- también se aceptan `;` o saltos de línea
+- si la columna no existe o está vacía, el comportamiento sigue igual que antes
+- si el bloque de una receta ocupa varias filas, el alias escrito en la primera fila aplica a todas las filas del bloque
+
+Regla crítica:
+
+- si el ticket usa cualquiera de los nombres listados en `NOMBRES NEOLA`, el motor debe aplicar la misma receta sin pedir confirmación adicional
+
 ## Hojas de inventario diario
 
 ### Estructura del bloque
@@ -152,6 +183,20 @@ En un cierre completo:
 1. escribir `VENTAS NEOLA`
 2. si `VENTAS NEOLA` quedó validado, escribir inventario diario completo
 3. leer diferencias finales del día
+
+### Escritura desde "solo registros"
+
+Cuando se crea el día sin ticket final:
+
+1. escribir el bloque del día en `C1`, `C2` y `LINEA CALIENTE`
+2. dejar `SALIDA` y `DIF` como fórmulas visibles
+3. en `C1` y `C2`, escribir `VENTAS` provisional desde `SALIDA`
+4. en `LINEA CALIENTE`, dejar `VENTAS` pendiente del ticket
+
+Regla crítica:
+
+- esta `VENTAS` provisional no es fuente de verdad para futuras sumas
+- cuando llegue el ticket, el motor debe recalcular desde `VENTAS NEOLA` + registros, no desde la columna `VENTAS` ya escrita
 
 ### Escritura incremental
 

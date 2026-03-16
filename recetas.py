@@ -168,25 +168,43 @@ def _similitud_platos(origen: str, candidato: str) -> float:
     return max(ratio, (ratio * 0.7) + (overlap * 0.3), prefix * 0.9)
 
 
-def sugerir_receta_similar(plato_neola: str, recetas: list[dict]) -> str | None:
-    candidatos = []
+def _nombres_neola_receta(receta: dict) -> list[str]:
+    nombres = []
     vistos = set()
+
+    for candidato in [receta.get("plato", ""), *(receta.get("nombres_neola") or [])]:
+        nombre = str(candidato).strip()
+        if not nombre:
+            continue
+        clave = normalizar_nombre(nombre)
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        nombres.append(nombre)
+
+    return nombres
+
+
+def sugerir_receta_similar(plato_neola: str, recetas: list[dict]) -> str | None:
+    candidatos = {}
     for receta in recetas:
         plato = receta.get("plato", "").strip()
         if not plato:
             continue
-        plato_norm = normalizar_nombre(plato)
-        if plato_norm in vistos:
-            continue
-        vistos.add(plato_norm)
-        candidatos.append(plato)
+        for candidato in _nombres_neola_receta(receta):
+            clave = normalizar_nombre(candidato)
+            if clave not in candidatos:
+                candidatos[clave] = {
+                    "candidato": candidato,
+                    "canonico": plato,
+                }
 
     mejor = None
     mejor_score = 0.0
-    for candidato in candidatos:
-        score = _similitud_platos(plato_neola, candidato)
+    for datos in candidatos.values():
+        score = _similitud_platos(plato_neola, datos["candidato"])
         if score > mejor_score:
-            mejor = candidato
+            mejor = datos["canonico"]
             mejor_score = score
 
     if mejor and mejor_score >= 0.74:
@@ -197,7 +215,11 @@ def sugerir_receta_similar(plato_neola: str, recetas: list[dict]) -> str | None:
 def buscar_receta(plato_neola: str, recetas: list[dict]) -> list[dict]:
     plato_norm = normalizar_nombre(plato_neola)
 
-    matches = [r for r in recetas if normalizar_nombre(r["plato"]) == plato_norm]
+    matches = [
+        receta
+        for receta in recetas
+        if plato_norm in {normalizar_nombre(nombre) for nombre in _nombres_neola_receta(receta)}
+    ]
     if matches:
         return matches
 

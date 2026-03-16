@@ -1,6 +1,6 @@
 ---
 name: motor-inventario-sambo
-description: Usa este skill cuando el usuario de Sambó quiera procesar una foto de cierre, precierre o preventa de Neola; crear el inventario diario solo con registros; cargar o actualizar ventas de un día ya existente; o ajustar ventas manualmente por texto. El flujo siempre hace preview, pide confirmación humana y luego actualiza Google Sheets.
+description: Usa este skill cuando el usuario de Sambó quiera procesar una foto de cierre, precierre o preventa de Neola; crear el inventario diario desde registros; cargar o actualizar ventas de un día ya existente; ajustar ventas manualmente por texto; o conciliar diferencias entre congeladores y línea caliente. Debe respetar aliases de nombres Neola definidos en RECETAS, hacer preview antes de escribir y evitar duplicar insumos cuando primero se crea el día con registros y luego llega el ticket.
 ---
 
 # Motor de Inventario — Sambó
@@ -13,7 +13,7 @@ Operar el cierre diario de Sambó desde Telegram. El usuario habla en lenguaje n
 
 - Este archivo: siempre.
 - `references/flujo-operativo.md`: antes de tocar reglas de negocio, recetas, ventas, inventario o diferencias.
-- `references/google-sheets.md`: solo si vas a cambiar cómo se ubica o escribe un bloque en Google Sheets.
+- `references/google-sheets.md`: solo si vas a cambiar cómo se ubica o escribe un bloque en Google Sheets, o si necesitas revisar la columna opcional `NOMBRES NEOLA` en `RECETAS`.
 
 ## Usa este skill cuando
 
@@ -107,6 +107,11 @@ python3 main.py /ruta/a/imagen.jpg --solo-ventas --confirmar
 
 Si el día no existe todavía, no intentes forzarlo: primero usa la Opción 2.
 
+Regla crítica:
+
+- al cargar el ticket después de Opción 2, recalcula desde `VENTAS NEOLA` + registros + recetas
+- no tomes la columna `VENTAS` provisional del inventario como base para sumar de nuevo
+
 ### Opción 1D. Actualizar con ticket nuevo
 
 Usa este flujo cuando ya había ventas cargadas y llega un ticket más completo del mismo día.
@@ -157,6 +162,8 @@ Flujo típico:
 
 - primero Opción 2 para crear el día con registros
 - después Opción 1C para cargar las ventas del ticket
+- en Opción 2, `C1` y `C2` quedan con `VENTAS` provisional desde `SALIDA`
+- `LINEA CALIENTE` queda pendiente del ticket, por eso puede mostrar diferencias esperadas
 
 ### Opción 3. Ajuste manual de ventas
 
@@ -225,8 +232,9 @@ Siempre muestra:
 
 1. fecha
 2. movimientos del día por ubicación
-3. aviso de que las ventas todavía quedarán vacías
-4. pregunta simple de confirmación
+3. aviso de que `C1` y `C2` quedarán con `VENTAS` provisional desde `SALIDA`
+4. aviso de que `LINEA CALIENTE` seguirá pendiente del ticket
+5. pregunta simple de confirmación
 
 ## Confirmación
 
@@ -242,15 +250,19 @@ Siempre muestra:
 - Si el usuario indica `precierre`, guárdalo como recordatorio del estado del día.
 - Si llega un ticket nuevo o un ajuste manual, compara contra las ventas actuales del día y modifica solo lo que cambió.
 - Después de un ticket nuevo o un ajuste manual, recalcula solo los insumos afectados del inventario.
+- En `solo-registros`, deja `SALIDA` y `DIF` como fórmulas visibles; si aparecen diferencias, son esperadas hasta que llegue el ticket.
 - Los platos ignorados por configuración sí deben aparecer en el preview con su motivo, pero no descuentan inventario.
 - Los items con `$0.00` sí cuentan como ventas reales y deben consumir inventario.
 - `ENSALADA CAESAR` sin proteína se toma como pollo y eso debe quedar explícito.
-- El match de recetas es exacto sobre el nombre corto normalizado. No uses `startswith` ni coincidencias parciales automáticas.
+- El match de recetas es exacto sobre el nombre corto normalizado, pero también debe aceptar cualquier alias listado en `RECETAS -> NOMBRES NEOLA`.
+- Si un alias existe, trátalo como match exacto; no lo mandes a "posible receta similar".
 - Si varias recetas comparten el mismo nombre corto y descuentan exactamente lo mismo, trátalas como una sola.
 - Si no hay match exacto, propone la receta más similar y bloquea hasta que el usuario confirme.
 - `ROLLITOS RELLENO` es ambiguo: resuélvelo por registros o por aclaración manual antes de cerrar.
 - Los panes en `LINEA CALIENTE` no se cuentan diariamente; conteo vacío no significa cero.
 - Las transferencias desde `C1` o `C2` hacia línea deben entrar como ingreso en `LINEA CALIENTE`.
+- En congeladores, `VENTAS` final puede representar venta de Neola, transferencia a línea o salida directa para preparación.
+- Si un insumo ya salió del congelador y luego llega un ticket con ese mismo consumo, no dupliques la cantidad: el recálculo final debe conciliar ambas fuentes.
 
 ## Cuándo bloquear y pedir aclaración
 
@@ -266,6 +278,7 @@ Bloquea el flujo y pide una aclaración corta si ocurre cualquiera de estos caso
 
 - Si no hay diferencias, responde: `✅ Todo cuadra, sin diferencias.`
 - Si hay diferencias, lista solo los insumos con su descuadre, salvo que el usuario pida más detalle.
+- Si hay diferencias, explica la causa más probable usando los datos dados: ticket faltante, salida manual, transferencia a línea, error de conteo, receta incompleta o problema humano.
 - Si falla la validación de `VENTAS NEOLA`, corrige ese bloque y vuelve a validar antes de tocar inventario.
 - Si el usuario pide una corrección puntual posterior, no reescribas todo el día: toca solo ventas o insumos afectados.
 - Si llega un ticket más completo después de un `precierre`, muestra solo la diferencia contra lo ya cargado y confirma antes de aplicar.
