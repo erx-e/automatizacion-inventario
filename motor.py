@@ -11,6 +11,7 @@ from recetas import (
     buscar_receta,
     calcular_consumo_teorico,
     es_ensalada_cesar_sin_proteina,
+    normalizar_nombre,
     plato_ignorado,
     resolver_variantes_receta,
     sugerir_receta_similar,
@@ -20,6 +21,7 @@ from sheets_connector import (
     leer_registros_dia_completo, escribir_ventas_neola,
     escribir_inventario_dia, leer_diferencias_inventario_dia,
     corregir_inventario_insumos, verificar_inventario_dia_existe,
+    leer_ventas_neola_dia,
 )
 
 # Zona horaria de Ecuador (UTC-5)
@@ -62,7 +64,8 @@ def _guardar_imagen_cierre(fecha: str, image_path: str = None, image_bytes: byte
 
 def _guardar_historial_cierre(fecha: str, ventas: list[dict],
                                consumo_agrupado: dict,
-                               diferencias: dict | None = None):
+                               diferencias: dict | None = None,
+                               metadata: dict | None = None):
     """Guarda un JSON con el resumen del cierre en cierres-diarios/{dd-mm-yyyy}/."""
     nombre_carpeta = _fecha_a_carpeta(fecha)
     carpeta = CIERRES_DIR / nombre_carpeta
@@ -81,11 +84,22 @@ def _guardar_historial_cierre(fecha: str, ventas: list[dict],
             for insumo, datos in consumo_agrupado.items()
         },
         "diferencias": diferencias,
+        "metadata": metadata or {},
     }
 
     destino = carpeta / f"{nombre_carpeta}.json"
     with open(destino, "w", encoding="utf-8") as f:
         json.dump(historial, f, ensure_ascii=False, indent=2)
+
+
+def _leer_historial_cierre(fecha: str) -> dict | None:
+    nombre_carpeta = _fecha_a_carpeta(fecha)
+    ruta = CIERRES_DIR / nombre_carpeta / f"{nombre_carpeta}.json"
+    if not ruta.exists():
+        return None
+
+    with open(ruta, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def fecha_ecuador():
@@ -257,6 +271,98 @@ def _agrupar_ventas_por_plato(ventas: list[dict]) -> list[dict]:
     return list(agrupadas.values())
 
 
+def _mapa_ventas_por_plato(ventas: list[dict]) -> dict[str, dict]:
+    agrupadas = {}
+    for venta in ventas:
+        plato = venta["plato"]
+        if plato not in agrupadas:
+            agrupadas[plato] = {
+                "plato": plato,
+                "cantidad": 0,
+                "precio_total": 0.0,
+            }
+        agrupadas[plato]["cantidad"] += int(venta.get("cantidad", 0) or 0)
+        agrupadas[plato]["precio_total"] += float(venta.get("precio_total", 0) or 0)
+    return agrupadas
+
+
+def _lista_ventas_desde_mapa(mapa_ventas: dict[str, dict]) -> list[dict]:
+    return [venta for venta in mapa_ventas.values() if venta["cantidad"] > 0]
+
+
+def _calcular_cambios_ventas(ventas_actuales: list[dict], ventas_nuevas: list[dict]) -> list[dict]:
+    mapa_actual = _mapa_ventas_por_plato(ventas_actuales)
+    mapa_nuevo = _mapa_ventas_por_plato(ventas_nuevas)
+
+    cambios = []
+    for plato in sorted(set(mapa_actual) | set(mapa_nuevo)):
+        cantidad_actual = mapa_actual.get(plato, {}).get("cantidad", 0)
+        cantidad_nueva = mapa_nuevo.get(plato, {}).get("cantidad", 0)
+        delta = cantidad_nueva - cantidad_actual
+        if delta == 0:
+            continue
+        cambios.append({
+            "plato": plato,
+            "cantidad_actual": cantidad_actual,
+            "cantidad_nueva": cantidad_nueva,
+            "delta": delta,
+        })
+    return cambios
+
+
+def _formatear_cambios_ventas(cambios: list[dict]) -> list[str]:
+    lineas = []
+    for cambio in cambios:
+        signo = "+" if cambio["delta"] > 0 else ""
+        lineas.append(
+            f"   • {cambio['plato']}: {cambio['cantidad_actual']} → "
+            f"{cambio['cantidad_nueva']} ({signo}{cambio['delta']})"
+        )
+    return lineas
+
+
+def _insumos_afectados(consumo_actual: dict, consumo_nuevo: dict) -> list[str]:
+    afectados = []
+    for insumo in sorted(set(consumo_actual) | set(consumo_nuevo)):
+        total_actual = consumo_actual.get(insumo, {}).get("total", 0)
+        total_nuevo = consumo_nuevo.get(insumo, {}).get("total", 0)
+        if total_actual != total_nuevo:
+            afectados.append(insumo)
+    return afectados
+
+
+def _aplicar_ajustes_ventas(ventas_actuales: list[dict], ajustes: list[dict]) -> list[dict]:
+    mapa_actual = _mapa_ventas_por_plato(ventas_actuales)
+    mapa_normalizado = {
+        normalizar_nombre(plato): plato
+        for plato in mapa_actual
+    }
+
+    for ajuste in ajustes:
+        plato_original = ajuste["plato"].strip()
+        clave_normalizada = normalizar_nombre(plato_original)
+        plato = mapa_normalizado.get(clave_normalizada, plato_original)
+        delta = int(ajuste["delta"])
+
+        if plato not in mapa_actual:
+            mapa_actual[plato] = {
+                "plato": plato,
+                "cantidad": 0,
+                "precio_total": 0.0,
+            }
+
+        nueva_cantidad = mapa_actual[plato]["cantidad"] + delta
+        if nueva_cantidad < 0:
+            raise ValueError(
+                f"El ajuste deja '{plato}' con cantidad negativa ({nueva_cantidad})."
+            )
+
+        mapa_actual[plato]["cantidad"] = nueva_cantidad
+        mapa_normalizado[clave_normalizada] = plato
+
+    return _lista_ventas_desde_mapa(mapa_actual)
+
+
 def _agrupar_consumo_por_plato(consumo: list[dict]) -> dict[str, list[dict]]:
     agrupado = {}
     for item in consumo:
@@ -373,7 +479,8 @@ def sugerir_fecha() -> tuple[str, str]:
 
 def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
                      media_type: str = "image/jpeg", fecha: str = None,
-                     rollitos_override: dict | None = None) -> dict:
+                     rollitos_override: dict | None = None,
+                     precierre: bool = False) -> dict:
     """
     PASO 1 del flujo: parsea la foto, calcula consumo teórico, sugiere fecha.
     NO escribe nada en Google Sheets. Devuelve un dict con toda la info
@@ -404,6 +511,7 @@ def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
         "alertas": [],
         "requiere_aclaracion": False,
         "rollitos_override": _normalizar_rollitos_override(rollitos_override),
+        "precierre": precierre,
         "resumen": ""
     }
 
@@ -470,6 +578,8 @@ def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
     # Fecha
     lineas.append(f"\n📅 Fecha: {resultado['fecha']}")
     lineas.append(f"   ({resultado['fecha_motivo']})")
+    if precierre:
+        lineas.append("   🟡 Ticket marcado como precierre")
 
     # Platos detectados con detalle de insumos
     total_platos = sum(v["cantidad"] for v in resultado["ventas"])
@@ -719,7 +829,16 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
             reporte.append(f"   {a}")
 
     # Guardar historial JSON del cierre
-    _guardar_historial_cierre(fecha, ventas, consumo_agrupado, diferencias_finales)
+    _guardar_historial_cierre(
+        fecha,
+        ventas,
+        consumo_agrupado,
+        diferencias_finales,
+        metadata={
+            "ticket_tipo": "precierre" if preparacion.get("precierre") else "cierre",
+            "origen": "cierre_completo",
+        },
+    )
 
     return "\n".join(reporte)
 
@@ -832,6 +951,294 @@ def _formatear_diferencias_inventario(diferencias: dict) -> list[str]:
     return lineas
 
 
+def _verificar_entrada_inventario(fecha: str) -> tuple[bool, str]:
+    try:
+        existencia = verificar_inventario_dia_existe(fecha)
+    except Exception as e:
+        return False, f"❌ Error al verificar inventario: {str(e)}"
+
+    hojas_faltantes = [hoja for hoja, existe in existencia.items() if not existe]
+    if hojas_faltantes:
+        return False, (
+            f"❌ No existe la entrada del {fecha} en: {', '.join(hojas_faltantes)}.\n"
+            "Primero crea o confirma la entrada del día en inventario."
+        )
+
+    return True, ""
+
+
+def _preparar_actualizacion_ventas(
+    *,
+    fecha: str,
+    ventas_finales: list[dict],
+    consumo_final: list[dict],
+    consumo_agrupado_final: dict,
+    alertas_finales: list[str],
+    requiere_aclaracion: bool,
+    recetas: list[dict],
+    origen: str,
+    descripcion: str,
+    precierre: bool = False,
+) -> dict:
+    ok_inventario, mensaje = _verificar_entrada_inventario(fecha)
+    if not ok_inventario:
+        return {"ok": False, "resumen": mensaje}
+
+    if requiere_aclaracion or _hay_alertas_de_receta_por_confirmar(alertas_finales):
+        lineas = [f"📋 {descripcion.upper()} — {fecha}", "=" * 40]
+        lineas.append("❌ No se puede continuar hasta aclarar el ticket.")
+        if alertas_finales:
+            lineas.append("\n⚠️ Alertas:")
+            for alerta in alertas_finales:
+                lineas.append(f"   {alerta}")
+        return {
+            "ok": False,
+            "resumen": "\n".join(lineas),
+        }
+
+    try:
+        ventas_actuales = leer_ventas_neola_dia(fecha)
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al leer ventas actuales: {str(e)}"}
+
+    try:
+        registros = leer_registros_dia_completo(fecha)
+        ubicaciones = leer_ubicacion_descuento()
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al leer datos del día: {str(e)}"}
+
+    datos_actuales = _preparar_datos_cierre(
+        ventas_actuales,
+        fecha,
+        recetas,
+        registros=registros,
+    )
+    cambios = _calcular_cambios_ventas(ventas_actuales, ventas_finales)
+    if not cambios:
+        return {
+            "ok": False,
+            "resumen": f"✅ El ticket no cambia las ventas del {fecha}.",
+        }
+
+    insumos_afectados = _insumos_afectados(
+        datos_actuales["consumo_agrupado"],
+        consumo_agrupado_final,
+    )
+    historial_previo = _leer_historial_cierre(fecha) or {}
+    ticket_tipo_previo = historial_previo.get("metadata", {}).get("ticket_tipo")
+
+    lineas = [f"📋 {descripcion.upper()} — {fecha}", "=" * 40]
+    if ticket_tipo_previo == "precierre":
+        lineas.append("ℹ️ Este día estaba marcado previamente como precierre.")
+    if precierre:
+        lineas.append("🟡 El nuevo ticket se registrará como precierre.")
+
+    lineas.append(f"\n🧾 Cambios detectados ({len(cambios)}):")
+    lineas.extend(_formatear_cambios_ventas(cambios))
+
+    total_platos = sum(v["cantidad"] for v in ventas_finales)
+    lineas.append(f"\n🍽️ Ventas finales ({total_platos} unidades):")
+    lineas.extend(_formatear_desglose_por_plato(ventas_finales, consumo_final, recetas))
+    lineas.append(_titulo_total_insumos(consumo_agrupado_final))
+    lineas.extend(_formatear_totales_por_insumo(consumo_agrupado_final))
+
+    lineas.append(f"\n🔧 Insumos a recalcular en inventario ({len(insumos_afectados)}):")
+    if insumos_afectados:
+        for insumo in insumos_afectados:
+            total_anterior = datos_actuales["consumo_agrupado"].get(insumo, {}).get("total", 0)
+            total_nuevo = consumo_agrupado_final.get(insumo, {}).get("total", 0)
+            lineas.append(f"   • {insumo}: {total_anterior} → {total_nuevo}")
+    else:
+        lineas.append("   • Sin cambios de insumos")
+
+    if alertas_finales:
+        lineas.append(f"\n⚠️ Alertas:")
+        for alerta in alertas_finales:
+            lineas.append(f"   {alerta}")
+
+    lineas.append(f"\n{'=' * 40}")
+    lineas.append("¿Todo correcto? ¿Aplico la actualización?")
+
+    return {
+        "ok": True,
+        "fecha": fecha,
+        "origen_actualizacion": origen,
+        "precierre": precierre,
+        "ventas_actuales": ventas_actuales,
+        "ventas_finales": ventas_finales,
+        "consumo_final": consumo_final,
+        "consumo_agrupado_final": consumo_agrupado_final,
+        "cambios": cambios,
+        "insumos_afectados": insumos_afectados,
+        "registros": registros,
+        "ubicaciones": ubicaciones,
+        "resumen": "\n".join(lineas),
+    }
+
+
+def _confirmar_actualizacion_ventas(
+    preparacion: dict,
+    *,
+    image_path: str = None,
+    image_bytes: bytes = None,
+) -> str:
+    fecha = preparacion["fecha"]
+
+    try:
+        escribir_ventas_neola(
+            fecha,
+            preparacion["ventas_finales"],
+            preparacion["consumo_final"],
+        )
+    except Exception as e:
+        return f"❌ Error al actualizar VENTAS NEOLA: {str(e)}"
+
+    if preparacion["insumos_afectados"]:
+        try:
+            corregir_inventario_insumos(
+                fecha,
+                preparacion["insumos_afectados"],
+                preparacion["consumo_agrupado_final"],
+                preparacion["registros"],
+                preparacion["ubicaciones"],
+            )
+        except Exception as e:
+            return f"❌ Ventas actualizadas, pero falló la corrección de inventario: {str(e)}"
+
+    if image_path or image_bytes:
+        _guardar_imagen_cierre(fecha, image_path=image_path, image_bytes=image_bytes)
+
+    try:
+        diferencias = leer_diferencias_inventario_dia(fecha)
+    except Exception as e:
+        diferencias = {"C1": [], "C2": [], "LINEA CALIENTE": []}
+
+    _guardar_historial_cierre(
+        fecha,
+        preparacion["ventas_finales"],
+        preparacion["consumo_agrupado_final"],
+        diferencias,
+        metadata={
+            "ticket_tipo": "precierre" if preparacion.get("precierre") else "cierre",
+            "origen": preparacion.get("origen_actualizacion", "actualizacion"),
+        },
+    )
+
+    lineas = [f"✅ ACTUALIZACIÓN APLICADA — {fecha}", "=" * 40]
+    lineas.append(f"\n🧾 Ventas modificadas ({len(preparacion['cambios'])}):")
+    lineas.extend(_formatear_cambios_ventas(preparacion["cambios"]))
+    lineas.append(f"\n🔧 Insumos recalculados: {len(preparacion['insumos_afectados'])}")
+    if preparacion["insumos_afectados"]:
+        for insumo in preparacion["insumos_afectados"]:
+            lineas.append(f"   • {insumo}")
+
+    lineas.extend(_formatear_diferencias_inventario(diferencias))
+    return "\n".join(lineas)
+
+
+# ============================================================
+# Actualizaciones incrementales de ventas
+# ============================================================
+
+def preparar_actualizacion_ticket(image_path: str = None, image_bytes: bytes = None,
+                                  media_type: str = "image/jpeg", fecha: str = None,
+                                  rollitos_override: dict | None = None,
+                                  precierre: bool = False) -> dict:
+    if not fecha:
+        fecha = sugerir_fecha()[0]
+
+    prep_ticket = preparar_cierre(
+        image_path=image_path,
+        image_bytes=image_bytes,
+        media_type=media_type,
+        fecha=fecha,
+        rollitos_override=rollitos_override,
+        precierre=precierre,
+    )
+    if not prep_ticket["ok"]:
+        return prep_ticket
+
+    try:
+        recetas = leer_recetas()
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al leer recetas: {str(e)}"}
+
+    actualizacion = _preparar_actualizacion_ventas(
+        fecha=fecha,
+        ventas_finales=prep_ticket["ventas"],
+        consumo_final=prep_ticket["consumo"],
+        consumo_agrupado_final=prep_ticket["consumo_agrupado"],
+        alertas_finales=prep_ticket["alertas"],
+        requiere_aclaracion=prep_ticket["requiere_aclaracion"],
+        recetas=recetas,
+        origen="ticket_nuevo",
+        descripcion="Actualización desde ticket",
+        precierre=precierre,
+    )
+    if actualizacion.get("ok"):
+        actualizacion["ventas_originales"] = prep_ticket.get("ventas_originales", prep_ticket["ventas"])
+    return actualizacion
+
+
+def confirmar_actualizacion_ticket(preparacion: dict, image_path: str = None,
+                                   image_bytes: bytes = None) -> str:
+    return _confirmar_actualizacion_ventas(
+        preparacion,
+        image_path=image_path,
+        image_bytes=image_bytes,
+    )
+
+
+def preparar_ajuste_ventas(fecha: str = None, ajustes: list[dict] | None = None) -> dict:
+    if not ajustes:
+        return {"ok": False, "resumen": "❌ Debes indicar al menos un ajuste de ventas."}
+
+    if not fecha:
+        fecha = sugerir_fecha()[0]
+
+    try:
+        recetas = leer_recetas()
+        ventas_actuales = leer_ventas_neola_dia(fecha)
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al leer datos: {str(e)}"}
+
+    try:
+        ventas_finales = _aplicar_ajustes_ventas(ventas_actuales, ajustes)
+    except ValueError as e:
+        return {"ok": False, "resumen": f"❌ {str(e)}"}
+
+    try:
+        registros = leer_registros_dia_completo(fecha)
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al leer registros: {str(e)}"}
+
+    datos_finales = _preparar_datos_cierre(
+        ventas_finales,
+        fecha,
+        recetas,
+        registros=registros,
+    )
+
+    preparacion = _preparar_actualizacion_ventas(
+        fecha=fecha,
+        ventas_finales=ventas_finales,
+        consumo_final=datos_finales["consumo"],
+        consumo_agrupado_final=datos_finales["consumo_agrupado"],
+        alertas_finales=datos_finales["alertas"],
+        requiere_aclaracion=datos_finales["requiere_aclaracion"],
+        recetas=recetas,
+        origen="ajuste_manual",
+        descripcion="Ajuste manual de ventas",
+    )
+    if preparacion.get("ok"):
+        preparacion["ajustes"] = ajustes
+    return preparacion
+
+
+def confirmar_ajuste_ventas(preparacion: dict) -> str:
+    return _confirmar_actualizacion_ventas(preparacion)
+
+
 # ============================================================
 # Opción 2: Inventario solo desde registros (sin ticket)
 # ============================================================
@@ -924,7 +1331,8 @@ def confirmar_inventario_registros(preparacion: dict) -> str:
 
 def preparar_solo_ventas(image_path: str = None, image_bytes: bytes = None,
                          media_type: str = "image/jpeg", fecha: str = None,
-                         rollitos_override: dict | None = None) -> dict:
+                         rollitos_override: dict | None = None,
+                         precierre: bool = False) -> dict:
     """
     Preview de ventas para cargar a una entrada de inventario ya existente.
     Requiere que la entrada del día ya exista (creada con solo-registros).
@@ -955,43 +1363,45 @@ def preparar_solo_ventas(image_path: str = None, image_bytes: bytes = None,
         media_type=media_type,
         fecha=fecha,
         rollitos_override=rollitos_override,
+        precierre=precierre,
     )
     if not prep["ok"]:
         return prep
 
-    # Reemplazar resumen con uno específico para solo-ventas
-    lineas = [f"📋 CARGAR VENTAS — {fecha}"]
-    lineas.append("=" * 40)
-    lineas.append("La entrada del día ya existe. Solo se actualizarán las VENTAS.")
-
-    total_platos = sum(v["cantidad"] for v in prep["ventas"])
-    recetas = []
     try:
         recetas = leer_recetas()
-    except Exception:
-        pass
+    except Exception as e:
+        return {"ok": False, "resumen": f"❌ Error al leer recetas: {str(e)}"}
 
-    lineas.append(f"\n🍽️ Platos e insumos ({total_platos} unidades):")
-    lineas.extend(_formatear_desglose_por_plato(prep["ventas"], prep["consumo"], recetas))
-    lineas.append(_titulo_total_insumos(prep["consumo_agrupado"]))
-    lineas.extend(_formatear_totales_por_insumo(prep["consumo_agrupado"]))
+    actualizacion = _preparar_actualizacion_ventas(
+        fecha=fecha,
+        ventas_finales=prep["ventas"],
+        consumo_final=prep["consumo"],
+        consumo_agrupado_final=prep["consumo_agrupado"],
+        alertas_finales=prep["alertas"],
+        requiere_aclaracion=prep["requiere_aclaracion"],
+        recetas=recetas,
+        origen="solo_ventas",
+        descripcion="Cargar ventas",
+        precierre=precierre,
+    )
+    if actualizacion.get("ok"):
+        lineas = actualizacion["resumen"].splitlines()
+        lineas.insert(2, "La entrada del día ya existe. Solo se actualizarán las VENTAS.")
+        actualizacion["resumen"] = "\n".join(lineas)
+        actualizacion["solo_ventas"] = True
+        actualizacion["ventas_originales"] = prep.get("ventas_originales", prep["ventas"])
+    return actualizacion
 
-    if prep["alertas"]:
-        lineas.append(f"\n⚠️ Alertas:")
-        for a in prep["alertas"]:
-            lineas.append(f"   {a}")
 
-    lineas.append(f"\n{'=' * 40}")
-    lineas.append("¿Todo correcto? ¿Cargo las ventas?")
-
-    prep["resumen"] = "\n".join(lineas)
-    prep["solo_ventas"] = True
-    return prep
-
-
-def confirmar_solo_ventas(preparacion: dict) -> str:
+def confirmar_solo_ventas(preparacion: dict, image_path: str = None,
+                          image_bytes: bytes = None) -> str:
     """Carga las ventas del ticket a una entrada de inventario ya existente."""
-    return confirmar_cierre(preparacion)
+    return _confirmar_actualizacion_ventas(
+        preparacion,
+        image_path=image_path,
+        image_bytes=image_bytes,
+    )
 
 
 # ============================================================
@@ -1000,11 +1410,13 @@ def confirmar_solo_ventas(preparacion: dict) -> str:
 
 def ejecutar_cierre(image_path: str = None, image_bytes: bytes = None,
                      media_type: str = "image/jpeg", fecha: str = None,
-                     rollitos_override: dict | None = None) -> str:
+                     rollitos_override: dict | None = None,
+                     precierre: bool = False) -> str:
     """Cierre completo sin confirmación (para terminal/testing)."""
     prep = preparar_cierre(image_path=image_path, image_bytes=image_bytes,
                             media_type=media_type, fecha=fecha,
-                            rollitos_override=rollitos_override)
+                            rollitos_override=rollitos_override,
+                            precierre=precierre)
     if not prep["ok"]:
         return prep["resumen"]
     return confirmar_cierre(

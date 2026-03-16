@@ -70,10 +70,10 @@ PLATOS_IGNORADOS = [
 ]
 
 
-def validar_configuracion():
+def validar_configuracion(requiere_anthropic: bool = True):
     """Verifica que las variables de entorno críticas estén configuradas."""
     errores = []
-    if not ANTHROPIC_API_KEY:
+    if requiere_anthropic and not ANTHROPIC_API_KEY:
         errores.append("ANTHROPIC_API_KEY no está configurada")
     if not Path(GOOGLE_CREDENTIALS_PATH).exists():
         errores.append(f"Archivo de credenciales no encontrado: {GOOGLE_CREDENTIALS_PATH}")

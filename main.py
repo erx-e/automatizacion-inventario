@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # main.py — Punto de entrada para probar el motor localmente
 import sys
-import json
 from config import validar_configuracion
 from motor import (
     ejecutar_cierre, solo_parsear_ticket, solo_consumo_teorico,
@@ -9,6 +8,8 @@ from motor import (
     preparar_correccion, confirmar_correccion,
     preparar_inventario_registros, confirmar_inventario_registros,
     preparar_solo_ventas, confirmar_solo_ventas,
+    preparar_actualizacion_ticket, confirmar_actualizacion_ticket,
+    preparar_ajuste_ventas, confirmar_ajuste_ventas,
 )
 
 
@@ -57,6 +58,55 @@ def _leer_fecha(argv: list[str]) -> str | None:
     return None
 
 
+def _leer_ajustes_ventas(argv: list[str]) -> list[dict] | None:
+    flag = "--ajustar-ventas"
+    if flag not in argv:
+        return None
+
+    idx = argv.index(flag)
+    if idx + 1 >= len(argv):
+        raise ValueError("Falta valor para --ajustar-ventas")
+
+    ajustes = []
+    for item in argv[idx + 1].split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError("Cada ajuste debe usar el formato PLATO:+N o PLATO:-N")
+
+        plato, delta = item.rsplit(":", 1)
+        plato = plato.strip()
+        delta = delta.strip()
+        if not plato or not delta:
+            raise ValueError("Cada ajuste debe usar el formato PLATO:+N o PLATO:-N")
+
+        try:
+            delta_valor = int(delta)
+        except ValueError as exc:
+            raise ValueError(f"Delta inválido en --ajustar-ventas: {delta!r}") from exc
+
+        ajustes.append({
+            "plato": plato,
+            "delta": delta_valor,
+        })
+
+    if not ajustes:
+        raise ValueError("Debes indicar al menos un ajuste en --ajustar-ventas")
+    return ajustes
+
+
+def _confirmar_interactivo(callback) -> None:
+    if not sys.stdin.isatty():
+        return
+
+    respuesta = input("\n> ").strip().lower()
+    if respuesta in ("si", "dale", "ok"):
+        print("\n" + callback())
+    else:
+        print("❌ Cancelado.")
+
+
 def main():
     if len(sys.argv) < 2:
         print("Uso:")
@@ -64,13 +114,16 @@ def main():
         print("  python3 main.py <imagen> --solo-leer          → Solo parsear el ticket")
         print("  python3 main.py <imagen> --consumo            → Solo consumo teórico")
         print("  python3 main.py <imagen> --preparar           → Preparar cierre (pide confirmación)")
+        print("  python3 main.py <imagen> --actualizar-ticket  → Comparar ticket nuevo con ventas actuales")
         print("  python3 main.py <imagen> --solo-ventas        → Solo cargar ventas a entrada existente")
         print("  python3 main.py --solo-registros              → Inventario solo desde registros (sin foto)")
+        print("  python3 main.py --ajustar-ventas 'NACHOS:+1,LOMO:-2'")
         print("  python3 main.py <imagen> --fecha 2026-03-11   → Con fecha específica")
         sys.exit(1)
 
+    requiere_anthropic = "--solo-registros" not in sys.argv and "--ajustar-ventas" not in sys.argv
     try:
-        validar_configuracion()
+        validar_configuracion(requiere_anthropic=requiere_anthropic)
     except EnvironmentError as e:
         print(f"❌ {str(e)}")
         sys.exit(1)
@@ -85,12 +138,27 @@ def main():
             return
         if confirmar:
             print("\n" + confirmar_inventario_registros(prep))
-        elif sys.stdin.isatty():
-            respuesta = input("\n> ").strip().lower()
-            if respuesta in ("si", "dale", "ok"):
-                print("\n" + confirmar_inventario_registros(prep))
-            else:
-                print("❌ Cancelado.")
+        else:
+            _confirmar_interactivo(lambda: confirmar_inventario_registros(prep))
+        return
+
+    try:
+        ajustes_ventas = _leer_ajustes_ventas(sys.argv)
+    except ValueError as e:
+        print(f"❌ {str(e)}")
+        sys.exit(1)
+
+    if ajustes_ventas is not None:
+        fecha = _leer_fecha(sys.argv)
+        confirmar = "--confirmar" in sys.argv
+        prep = preparar_ajuste_ventas(fecha=fecha, ajustes=ajustes_ventas)
+        print(prep["resumen"])
+        if not prep["ok"]:
+            return
+        if confirmar:
+            print("\n" + confirmar_ajuste_ventas(prep))
+        else:
+            _confirmar_interactivo(lambda: confirmar_ajuste_ventas(prep))
         return
 
     if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
@@ -100,6 +168,7 @@ def main():
     image_path = sys.argv[1]
     fecha = _leer_fecha(sys.argv)
     usar_registros_rollitos = "--usar-registros-rollitos" in sys.argv
+    precierre = "--precierre" in sys.argv
     try:
         rollitos_override = _leer_rollitos_override(sys.argv)
         insumos_correccion = _leer_insumos(sys.argv, "--corregir-insumos")
@@ -126,19 +195,33 @@ def main():
             image_path=image_path,
             fecha=fecha,
             rollitos_override=rollitos_override,
+            precierre=precierre,
         )
         print(prep["resumen"])
         if not prep["ok"]:
             return
         confirmar = "--confirmar" in sys.argv
         if confirmar:
-            print("\n" + confirmar_solo_ventas(prep))
-        elif sys.stdin.isatty():
-            respuesta = input("\n> ").strip().lower()
-            if respuesta in ("si", "dale", "ok"):
-                print("\n" + confirmar_solo_ventas(prep))
-            else:
-                print("❌ Cancelado.")
+            print("\n" + confirmar_solo_ventas(prep, image_path=image_path))
+        else:
+            _confirmar_interactivo(lambda: confirmar_solo_ventas(prep, image_path=image_path))
+        return
+
+    if "--actualizar-ticket" in sys.argv:
+        prep = preparar_actualizacion_ticket(
+            image_path=image_path,
+            fecha=fecha,
+            rollitos_override=rollitos_override,
+            precierre=precierre,
+        )
+        print(prep["resumen"])
+        if not prep["ok"]:
+            return
+        confirmar = "--confirmar" in sys.argv
+        if confirmar:
+            print("\n" + confirmar_actualizacion_ticket(prep, image_path=image_path))
+        else:
+            _confirmar_interactivo(lambda: confirmar_actualizacion_ticket(prep, image_path=image_path))
         return
 
     if "--preparar" in sys.argv:
@@ -146,6 +229,7 @@ def main():
             image_path=image_path,
             fecha=fecha,
             rollitos_override=rollitos_override,
+            precierre=precierre,
         )
         print(prep["resumen"])
 
@@ -212,6 +296,7 @@ def main():
         image_path=image_path,
         fecha=fecha,
         rollitos_override=rollitos_override,
+        precierre=precierre,
     ))
 
 

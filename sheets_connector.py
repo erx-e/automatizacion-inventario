@@ -449,6 +449,36 @@ def _escribir_bloque_ventas_neola(ws, next_row: int, rows_to_write: list[list[st
         _esperar_despues_de_write()
 
 
+def _insertar_filas_ventas_neola(ws, row: int, cantidad: int):
+    if cantidad <= 0:
+        return
+
+    values = [[""] * COLUMNAS_VENTAS_NEOLA for _ in range(cantidad)]
+    if hasattr(ws, "insert_rows"):
+        try:
+            ws.insert_rows(values, row=row, inherit_from_before=True)
+            _esperar_despues_de_write()
+            return
+        except TypeError:
+            ws.insert_rows(values, row=row)
+            _esperar_despues_de_write()
+            return
+
+    requests = [{
+        "insertDimension": {
+            "range": {
+                "sheetId": ws.id,
+                "dimension": "ROWS",
+                "startIndex": row - 1,
+                "endIndex": row - 1 + cantidad,
+            },
+            "inheritFromBefore": True,
+        }
+    }]
+    ws.spreadsheet.batch_update({"requests": requests})
+    _esperar_despues_de_write()
+
+
 def _construir_filas_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]) -> list[list[str]]:
     fecha_display = _fecha_a_display(fecha)
     ventas_agrupadas = _agrupar_ventas_neola(ventas)
@@ -497,6 +527,14 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
         ws.add_rows(total_rows - ws.row_count)
         _esperar_despues_de_write()
 
+    longitud_existente = _longitud_bloque_existente_ventas(all_values, fila_existente) if fila_existente else 0
+    if fila_existente and len(rows_to_write) > longitud_existente:
+        _insertar_filas_ventas_neola(
+            ws,
+            next_row + longitud_existente,
+            len(rows_to_write) - longitud_existente,
+        )
+
     if next_row > 4 and not fila_existente:
         requests = [
             {
@@ -544,7 +582,6 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
         sh.batch_update({"requests": requests})
         _esperar_despues_de_write()
 
-    longitud_existente = _longitud_bloque_existente_ventas(all_values, fila_existente) if fila_existente else 0
     filas_a_limpiar = max(len(rows_to_write), longitud_existente)
     ultimo_error = None
     for _ in range(3):
@@ -563,6 +600,31 @@ def escribir_ventas_neola(fecha: str, ventas: list[dict], consumo: list[dict]):
         "No se pudo corregir automaticamente VENTAS NEOLA: "
         f"{ultimo_error}"
     )
+
+
+def leer_ventas_neola_dia(fecha: str) -> list[dict]:
+    gc = get_client()
+    sh = gc.open_by_key(SHEET_REGISTROS)
+    ws = sh.worksheet(HOJA_VENTAS_NEOLA)
+    all_values = _leer_valores_hoja(
+        ws,
+        f"A1:{gspread.utils.rowcol_to_a1(ws.row_count, max(ws.col_count, COLUMNAS_VENTAS_NEOLA))}",
+    )
+    fila_existente = _buscar_fila_fecha_ventas(all_values, fecha)
+    if fila_existente is None:
+        return []
+
+    longitud_existente = _longitud_bloque_existente_ventas(all_values, fila_existente)
+    rows_bloque = all_values[fila_existente - 1:fila_existente - 1 + longitud_existente]
+    actual = _estructura_actual_ventas_neola(rows_bloque)
+    return [
+        {
+            "plato": plato,
+            "cantidad": datos["cantidad"],
+            "precio_total": 0.0,
+        }
+        for plato, datos in actual.items()
+    ]
 
 
 # ============================================================
@@ -775,6 +837,71 @@ def _valores_inventario_para_insumo(
     ]
 
 
+def _referencia_celda(row: int, col: int) -> str:
+    return gspread.utils.rowcol_to_a1(row, col)
+
+
+def _formula_salida_inventario(ubicacion_key: str, row: int, col_destino: int, conteo_presente: bool) -> str:
+    inicio_ref = _referencia_celda(row, col_destino)
+    ingreso_ref = _referencia_celda(row, col_destino + 1)
+    ventas_ref = _referencia_celda(row, col_destino + 4)
+    cierre_ref = _referencia_celda(row, col_destino + 5)
+
+    if ubicacion_key == "LINEA" and not conteo_presente:
+        return f"={inicio_ref}+{ingreso_ref}-{cierre_ref}-{ventas_ref}"
+
+    return f"={inicio_ref}+{ingreso_ref}-{cierre_ref}"
+
+
+def _formula_dif_inventario(ubicacion_key: str, row: int, col_destino: int, conteo_presente: bool) -> str:
+    if ubicacion_key == "LINEA" and not conteo_presente:
+        return "=0"
+
+    salida_ref = _referencia_celda(row, col_destino + 2)
+    ventas_ref = _referencia_celda(row, col_destino + 4)
+    return f"={salida_ref}-{ventas_ref}"
+
+
+def _fila_inventario_para_insumo(
+    *,
+    ubicacion_key: str,
+    row: int,
+    col_destino: int,
+    insumo: str,
+    cierre_previo: int,
+    registro: dict,
+    consumo_por_hoja: dict,
+    registros: dict,
+    tabla_ubicaciones: dict,
+    ingresos_linea_transferidos: dict,
+) -> list:
+    valores = _valores_inventario_para_insumo(
+        ubicacion_key,
+        insumo,
+        cierre_previo,
+        registro,
+        consumo_por_hoja,
+        registros,
+        tabla_ubicaciones,
+        ingresos_linea_transferidos,
+    )
+    conteo_presente = ubicacion_key == "LINEA" and registro.get("conteo") is not None
+
+    return [
+        valores[0],
+        valores[1],
+        _formula_salida_inventario(ubicacion_key, row, col_destino, conteo_presente),
+        _formula_dif_inventario(ubicacion_key, row, col_destino, conteo_presente),
+        valores[4],
+        valores[5],
+    ]
+
+
+def _batch_update_user_entered(ws, data: list[dict]):
+    ws.batch_update(data, raw=False)
+    _esperar_despues_de_write()
+
+
 def _contexto_bloque_inventario(ws, fecha: str) -> tuple[int, int, int, int, list[str], list[str]]:
     fila_mes, fila_fechas, fila_headers, fila_datos, fila_fin = _buscar_seccion_mes_inventario(ws, fecha)
     col_destino = _buscar_bloque_fecha_inventario(ws, fila_fechas, fecha)
@@ -832,15 +959,17 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
             cierre_previo = _parsear_numero(cierres_previos[fila - 1] if fila - 1 < len(cierres_previos) else "")
             registro = registros.get(ubicacion_key, {}).get(insumo, {})
             rango_bloque.append(
-                _valores_inventario_para_insumo(
-                    ubicacion_key,
-                    insumo,
-                    cierre_previo,
-                    registro,
-                    consumo_por_hoja,
-                    registros,
-                    tabla_ubicaciones,
-                    ingresos_linea_transferidos,
+                _fila_inventario_para_insumo(
+                    ubicacion_key=ubicacion_key,
+                    row=fila,
+                    col_destino=col_destino,
+                    insumo=insumo,
+                    cierre_previo=cierre_previo,
+                    registro=registro,
+                    consumo_por_hoja=consumo_por_hoja,
+                    registros=registros,
+                    tabla_ubicaciones=tabla_ubicaciones,
+                    ingresos_linea_transferidos=ingresos_linea_transferidos,
                 )
             )
 
@@ -850,15 +979,18 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
                 "values": [["INICIO", "INGRESO", "SALIDA", "DIF", "VENTAS", "CIERRE"]],
             },
             {
-                "range": f"{gspread.utils.rowcol_to_a1(fila_datos, col_destino)}:{gspread.utils.rowcol_to_a1(fila_fin, col_destino + 5)}",
-                "values": rango_bloque,
-            },
-            {
                 "range": gspread.utils.rowcol_to_a1(fila_fechas, col_destino),
                 "values": [[fecha_display]],
             },
         ])
         _esperar_despues_de_write()
+
+        _batch_update_user_entered(ws, [
+            {
+                "range": f"{gspread.utils.rowcol_to_a1(fila_datos, col_destino)}:{gspread.utils.rowcol_to_a1(fila_fin, col_destino + 5)}",
+                "values": rango_bloque,
+            },
+        ])
 
 
 def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado: dict,
@@ -889,15 +1021,17 @@ def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado
 
             cierre_previo = _parsear_numero(cierres_previos[fila - 1] if fila - 1 < len(cierres_previos) else "")
             registro = registros.get(ubicacion_key, {}).get(insumo, {})
-            values = _valores_inventario_para_insumo(
-                ubicacion_key,
-                insumo,
-                cierre_previo,
-                registro,
-                consumo_por_hoja,
-                registros,
-                tabla_ubicaciones,
-                ingresos_linea_transferidos,
+            values = _fila_inventario_para_insumo(
+                ubicacion_key=ubicacion_key,
+                row=fila,
+                col_destino=col_destino,
+                insumo=insumo,
+                cierre_previo=cierre_previo,
+                registro=registro,
+                consumo_por_hoja=consumo_por_hoja,
+                registros=registros,
+                tabla_ubicaciones=tabla_ubicaciones,
+                ingresos_linea_transferidos=ingresos_linea_transferidos,
             )
             updates.append({
                 "range": (
@@ -909,8 +1043,7 @@ def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado
             actualizados[hoja_nombre].append(insumo)
 
         if updates:
-            ws.batch_update(updates)
-            _esperar_despues_de_write()
+            _batch_update_user_entered(ws, updates)
 
     return actualizados
 

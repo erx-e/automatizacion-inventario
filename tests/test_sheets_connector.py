@@ -382,6 +382,72 @@ class InventarioHelpersTests(unittest.TestCase):
 
         self.assertEqual(valores, [6, 10, 10, 0, 10, 6])
 
+    def test_fila_inventario_para_insumo_c1_escribe_formulas_en_salida_y_dif(self):
+        consumo_por_hoja = {"C1": {"POLLO 200 gr": 3}, "C2": {}, "LINEA": {}}
+        registros = {"C1": {"POLLO 200 gr": {"ingreso": 0, "salida": 3, "motivo": ""}}, "C2": {}, "LINEA": {}}
+        tabla = {"POLLO 200 gr": {"descuento": "C1"}}
+
+        fila = sheets_connector._fila_inventario_para_insumo(
+            ubicacion_key="C1",
+            row=12,
+            col_destino=7,
+            insumo="POLLO 200 gr",
+            cierre_previo=10,
+            registro=registros["C1"]["POLLO 200 gr"],
+            consumo_por_hoja=consumo_por_hoja,
+            registros=registros,
+            tabla_ubicaciones=tabla,
+            ingresos_linea_transferidos={},
+        )
+
+        self.assertEqual(
+            fila,
+            [10, "", "=R12C7+R12C8-R12C12", "=R12C9-R12C11", 3, 7],
+        )
+
+    def test_fila_inventario_para_insumo_linea_sin_conteo_usa_formula_especial(self):
+        consumo_por_hoja = {"C1": {}, "C2": {}, "LINEA": {"PAN BRIOCHE": 7}}
+        registros = {
+            "C1": {},
+            "C2": {},
+            "LINEA": {"PAN BRIOCHE": {"conteo": None, "ingreso": 12, "salida": 2, "motivo": ""}},
+        }
+
+        fila = sheets_connector._fila_inventario_para_insumo(
+            ubicacion_key="LINEA",
+            row=5,
+            col_destino=1,
+            insumo="PAN BRIOCHE",
+            cierre_previo=6,
+            registro=registros["LINEA"]["PAN BRIOCHE"],
+            consumo_por_hoja=consumo_por_hoja,
+            registros=registros,
+            tabla_ubicaciones={},
+            ingresos_linea_transferidos={},
+        )
+
+        self.assertEqual(
+            fila,
+            [6, 12, "=R5C1+R5C2-R5C6-R5C5", "=0", 7, 9],
+        )
+
+
+class UserEnteredWriteTests(unittest.TestCase):
+    def test_batch_update_user_entered_usa_raw_false(self):
+        class Worksheet:
+            def __init__(self):
+                self.calls = []
+
+            def batch_update(self, data, raw=True):
+                self.calls.append({"data": data, "raw": raw})
+
+        ws = Worksheet()
+        payload = [{"range": "R1C1:R1C6", "values": [["", "", "=R1C1-R1C2", "=0", "", ""]]}]
+
+        sheets_connector._batch_update_user_entered(ws, payload)
+
+        self.assertEqual(ws.calls, [{"data": payload, "raw": False}])
+
 
 if __name__ == "__main__":
     unittest.main()
