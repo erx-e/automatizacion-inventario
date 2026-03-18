@@ -1,6 +1,6 @@
 ---
 name: motor-inventario-sambo
-description: Usa este skill cuando el usuario de Sambó, por Telegram o WhatsApp, quiera procesar una foto de cierre, precierre o preventa de Neola; crear el inventario diario desde registros; cargar o actualizar ventas de un día ya existente; ajustar ventas manualmente por texto; o conciliar diferencias entre congeladores y línea caliente. Debe hablar en lenguaje simple, hacer preview antes de escribir, avisar hitos de avance en procesos largos, pedir que no editen manualmente las hojas mientras el proceso esté activo, continuar con tickets parcialmente legibles usando solo lo que sí se puede leer, respetar aliases de nombres Neola definidos en RECETAS sin duplicar insumos y nunca modificar hojas de registro directamente desde la conversación: esas correcciones se notifican después de que el usuario las haga manualmente.
+description: Usa este skill cuando el usuario de Sambó, por Telegram o WhatsApp, quiera procesar una foto de cierre, precierre o preventa de Neola; crear el inventario diario desde registros; cargar o actualizar ventas de un día ya existente; ajustar ventas manualmente por texto; o conciliar diferencias entre congeladores y línea caliente. Debe hablar en lenguaje simple, hacer preview antes de escribir, avisar hitos de avance en procesos largos, pedir que no editen manualmente las hojas mientras el proceso esté activo, continuar con tickets parcialmente legibles usando solo lo que sí se puede leer, respetar aliases de nombres Neola definidos en RECETAS sin duplicar insumos, usar `MOTIVOS ESPECIALES` como única fuente de movimientos especiales del día y nunca modificar hojas de registro ni `MOTIVOS ESPECIALES` directamente desde la conversación: esas correcciones se notifican después de que el usuario las haga manualmente.
 ---
 
 # Motor de Inventario — Sambó
@@ -19,7 +19,7 @@ Operar el cierre diario de Sambó desde Telegram o WhatsApp. El usuario habla en
 
 - el usuario manda una foto de ticket, cierre, precierre o preventa de Neola
 - pide "solo registros", "crear entradas del día", "subir ventas", "actualizar cierre", "faltó vender", "súmale" o "réstale"
-- pide reportar una corrección manual del registro del personal de cocina, un conteo, una salida, un ingreso o un motivo
+- pide reportar una corrección manual del registro del personal de cocina, un conteo, una salida, un ingreso o un movimiento especial ya corregido manualmente
 - quiere corregir ventas o inventario de un día ya escrito
 
 ## Contrato de conversación
@@ -33,7 +33,10 @@ Operar el cierre diario de Sambó desde Telegram o WhatsApp. El usuario habla en
 - No hables de JSON, API, parser, caché ni detalles internos.
 - Si la imagen no se lee completa, dilo de forma simple, pide una foto mejor o ayuda con los nombres dudosos, pero sigue con lo que sí se alcanza a leer cuando el flujo lo permita.
 - Si el usuario dice que ignores líneas tapadas o borrosas, hazlo y continúa con el precierre o la actualización usando solo lo legible.
-- No modifiques hojas de registro directamente desde la conversación. Solo léelas. Si el usuario corrigió un registro manualmente, pídele que te avise con ubicación, columna, insumo y valor final.
+- No modifiques hojas de registro directamente desde la conversación. Solo léelas.
+- No modifiques `MOTIVOS ESPECIALES` directamente desde la conversación. Solo léela.
+- Si el usuario corrigió un registro principal manualmente, pídele ubicación, columna, insumo y valor final.
+- Si el usuario corrigió solo `MOTIVOS ESPECIALES`, pídele ubicación e insumo para releer ese insumo con sus movimientos especiales actuales.
 
 ## Hitos de avance
 
@@ -205,6 +208,8 @@ Flujo típico:
 - después Opción 1C para cargar las ventas del ticket
 - en Opción 2, `C1` y `C2` quedan con `VENTAS` provisional desde `SALIDA`
 - `LINEA CALIENTE` queda pendiente del ticket, por eso puede mostrar diferencias esperadas
+- la decisión de si un insumo del congelador va a `LINEA` o se descuenta en el mismo congelador sale de `UBICACION DESCUENTO`
+- si hay una salida especial en `MOTIVOS ESPECIALES`, esa cantidad sigue descontando inventario pero no debe entrar a línea como ingreso cuando `UBICACION DESCUENTO` lo manda a `LINEA`
 
 ### Opción 3. Ajuste manual de ventas
 
@@ -225,7 +230,7 @@ python3 main.py --ajustar-ventas "NACHOS:+1,LOMO:-2" --fecha 2026-03-11 --confir
 ```
 
 ### Opción 4. Aviso de corrección manual de registros
-Usa este flujo cuando el usuario diga que ya corrigió manualmente un registro en la hoja y quiere que revises el impacto en inventario.
+Usa este flujo cuando el usuario diga que ya corrigió manualmente un registro en la hoja o en `MOTIVOS ESPECIALES` y quiere que revises el impacto en inventario.
 
 Regla crítica:
 
@@ -239,36 +244,55 @@ Comando interno para el agente:
 cd {baseDir}
 python3 main.py --registro-corregido "LINEA|POLLO 160 gr CECAR|conteo=2" --fecha 2026-03-11
 python3 main.py --registro-corregido "C1|FILETE DE POLLO 200 gr|salida=4" --fecha 2026-03-11 --confirmar
+python3 main.py --registro-corregido "LINEA|PAN DE HOT DOG" --fecha 2026-03-11
 ```
 
 Qué debe pedir OpenClaw al usuario:
 
+- usa siempre formato compacto con `|`
 - ubicación: `C1`, `C2`, `LINEA` o `LINEA CALIENTE`
-- columna corregida: `conteo`, `ingreso`, `salida` o `motivo`
-- insumo
-- valor final corregido
+- si corrigió el registro principal: columna corregida `conteo`, `ingreso` o `salida`
+- si corrigió movimientos especiales: usa `ingreso-especial=motivo:cantidad`, `salida-especial=motivo:cantidad` o `sin-especiales`
+- si hay varios cambios, sepáralos con `;`
 
-Formato que debes pedir cuando el usuario quiera avisar una corrección:
+Formato exacto que debes pedir:
 
-- `Se corrigió el registro de {insumo} en {ubicacion}, columna {columna}, valor final {valor}.`
+- `UBICACION|INSUMO|campo=valor`
+- `UBICACION|INSUMO|sin-especiales`
+- `UBICACION|INSUMO|campo=valor|sin-especiales`
+- `UBICACION|INSUMO|campo=valor|ingreso-especial=motivo:cantidad`
+- `UBICACION|INSUMO|campo=valor|salida-especial=motivo:cantidad`
+- `UBICACION|INSUMO|campo=valor|ingreso-especial=motivo:cantidad|salida-especial=motivo:cantidad`
 
 Ejemplos válidos:
 
-- `Se corrigió el registro de POLLO 160 gr CECAR en LINEA, columna conteo, valor final 2.`
-- `Se corrigió el registro de FILETE DE POLLO 200 gr en C1, columna salida, valor final 4.`
-- `Se corrigió el registro de KLOBASA DE PRAGA en C2, columna motivo, valor final traslado a linea.`
+- `LINEA|POLLO 160 gr CECAR|conteo=2`
+- `C1|FILETE DE POLLO 200 gr|salida=4`
+- `LINEA|PAN DE CERVEZA|ingreso=0|sin-especiales`
+- `C2|CALAMAR 110 GR|salida=1|sin-especiales`
+- `LINEA|PAN DE HOT DOG|ingreso=5|ingreso-especial=recibido de urdesa:2`
+- `C1|FILETE DE POLLO 200 gr|salida=15|salida-especial=enviado a urdesa:5`
+- `LINEA|PAN DE CERVEZA|ingreso=0|sin-especiales;C2|CALAMAR 110 GR|salida=1|sin-especiales`
 
 Si el usuario lo pide de forma ambigua, no adivines. Respóndele con una instrucción corta como esta:
 
-- `Para revisarlo bien, dime la corrección en este formato: se corrigió el registro de {insumo} en {ubicacion}, columna {columna}, valor final {valor}.`
+- `Para revisarlo bien, envíamelo en este formato: UBICACION|INSUMO|campo=valor.`
+- `Si cambiaste movimientos especiales, usa este formato: UBICACION|INSUMO|sin-especiales o UBICACION|INSUMO|campo=valor|ingreso-especial=motivo:cantidad.`
 
 Reglas:
 
-- `C1` y `C2` aceptan `ingreso`, `salida` y `motivo`
-- `LINEA` o `LINEA CALIENTE` acepta `conteo`, `ingreso`, `salida` y `motivo`
+- `C1` y `C2` aceptan `ingreso` y `salida`
+- `LINEA` o `LINEA CALIENTE` acepta `conteo`, `ingreso` y `salida`
+- los movimientos especiales ya no viven en los registros principales; se leen desde `MOTIVOS ESPECIALES`
+- en `MOTIVOS ESPECIALES`, `TIPO=INGRESO` o `TIPO=SALIDA` y la `CANTIDAD` siempre es parte del ingreso o salida total del registro principal
+- OpenClaw debe asumir que `MOTIVOS ESPECIALES` se usa filtrando por la fecha de trabajo actual; no debe mezclar movimientos de otros días
+- la suma de ingresos especiales nunca puede ser mayor que el `INGRESO` total del registro principal
+- la suma de salidas especiales nunca puede ser mayor que la salida total del insumo
+- `sin-especiales` significa eliminación completa de todos los movimientos especiales de ese insumo para la fecha actual
 - si el usuario menciona `congelador`, pide que especifique si es `C1` o `C2`
 - si falta ubicación, columna, insumo o valor final, pide solo ese dato faltante
 - después del aviso del usuario, relee registros del día
+- al releer registros del día, OpenClaw también debe releer `MOTIVOS ESPECIALES`
 - si ya hay ventas cargadas ese día, resincroniza el inventario con esas ventas
 - si todavía no hay ventas cargadas, recalcula el inventario solo desde registros
 - al final, informa si quedó alguna diferencia o si todo quedó cuadrado
@@ -359,7 +383,11 @@ Siempre muestra:
 - `ROLLITOS RELLENO` es ambiguo: resuélvelo por registros o por aclaración manual antes de cerrar.
 - Los panes en `LINEA CALIENTE` no se cuentan diariamente; conteo vacío no significa cero.
 - Las transferencias desde `C1` o `C2` hacia línea deben entrar como ingreso en `LINEA CALIENTE`.
+- Si un insumo tiene movimientos especiales en `MOTIVOS ESPECIALES`, esa cantidad sigue afectando el cierre del inventario, pero su efecto operativo depende de `UBICACION DESCUENTO`.
+- `MOTIVOS ESPECIALES` solo afecta el día que coincide con la fecha del proceso; si el usuario corrige esa hoja para otro día, primero confirma la fecha exacta.
 - En congeladores, `VENTAS` final puede representar venta de Neola, transferencia a línea o salida directa para preparación.
+- Si en `UBICACION DESCUENTO` el insumo va de congelador a línea, la `cantidad` especial reduce el `INGRESO` a línea, no el `CIERRE` del congelador ni la `VENTAS` provisional del congelador.
+- Si en `UBICACION DESCUENTO` el insumo se usa directo para un plato, la `cantidad` especial se suma a la parte esperada en `VENTAS` del congelador.
 - Si un insumo ya salió del congelador y luego llega un ticket con ese mismo consumo, no dupliques la cantidad: el recálculo final debe conciliar ambas fuentes.
 
 ## Cuándo bloquear y pedir aclaración

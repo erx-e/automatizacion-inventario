@@ -11,7 +11,6 @@ from motor import (
     preparar_solo_ventas, confirmar_solo_ventas,
     preparar_actualizacion_ticket, confirmar_actualizacion_ticket,
     preparar_ajuste_ventas, confirmar_ajuste_ventas,
-    preparar_ajuste_registros, confirmar_ajuste_registros,
     preparar_registro_corregido, confirmar_registro_corregido,
 )
 
@@ -124,28 +123,51 @@ def _leer_cambios_registro(argv: list[str], flag: str) -> list[dict] | None:
             continue
 
         partes = [item.strip() for item in bloque.split("|") if item.strip()]
-        if len(partes) < 3:
+        if len(partes) < 2:
             raise ValueError(
-                "Cada ajuste de registro debe usar el formato UBICACION|INSUMO|campo=valor"
+                "Cada aviso de registro debe usar el formato UBICACION|INSUMO o UBICACION|INSUMO|campo=valor"
             )
 
         ubicacion = partes[0]
         insumo = partes[1]
         cambios = {}
+        motivos_ingreso_esperados = []
+        motivos_salida_esperados = []
+        verificar_especiales = False
         for parte in partes[2:]:
+            if parte.lower() == "sin-especiales":
+                verificar_especiales = True
+                continue
             if "=" not in parte:
                 raise ValueError(
-                    "Cada ajuste de registro debe usar el formato UBICACION|INSUMO|campo=valor"
+                    "Cada aviso de registro debe usar el formato UBICACION|INSUMO|campo=valor, "
+                    "UBICACION|INSUMO|sin-especiales o UBICACION|INSUMO|ingreso-especial=motivo:cantidad"
                 )
             campo, valor = parte.split("=", 1)
             campo = campo.strip().lower()
             valor = valor.strip()
-            if campo not in {"conteo", "ingreso", "salida", "motivo"}:
-                raise ValueError(f"Campo inválido en {flag}: {campo!r}")
-
-            if campo == "motivo":
-                cambios[campo] = valor
+            if campo in {"ingreso-especial", "salida-especial"}:
+                if ":" not in valor:
+                    raise ValueError(
+                        f"Cada {campo} debe usar el formato motivo:cantidad"
+                    )
+                motivo, cantidad_raw = valor.rsplit(":", 1)
+                motivo = motivo.strip()
+                cantidad_raw = cantidad_raw.strip()
+                if not motivo:
+                    raise ValueError(f"Falta el motivo en {campo}")
+                try:
+                    cantidad = int(cantidad_raw)
+                except ValueError as exc:
+                    raise ValueError(f"Cantidad inválida en {campo}: {cantidad_raw!r}") from exc
+                if cantidad <= 0:
+                    raise ValueError(f"La cantidad en {campo} debe ser mayor a cero")
+                bucket = motivos_ingreso_esperados if campo == "ingreso-especial" else motivos_salida_esperados
+                bucket.append({"motivo": motivo, "cantidad": cantidad})
+                verificar_especiales = True
                 continue
+            if campo not in {"conteo", "ingreso", "salida"}:
+                raise ValueError(f"Campo inválido en {flag}: {campo!r}")
 
             try:
                 cambios[campo] = int(valor)
@@ -156,6 +178,9 @@ def _leer_cambios_registro(argv: list[str], flag: str) -> list[dict] | None:
             "ubicacion": ubicacion,
             "insumo": insumo,
             "cambios": cambios,
+            "verificar_especiales": verificar_especiales,
+            "motivos_ingreso_esperados": motivos_ingreso_esperados,
+            "motivos_salida_esperados": motivos_salida_esperados,
         })
 
     if not ajustes:
@@ -185,15 +210,17 @@ def main():
         print("  python3 main.py <imagen> --solo-ventas        → Solo cargar ventas a entrada existente")
         print("  python3 main.py --solo-registros              → Inventario solo desde registros (sin foto)")
         print("  python3 main.py --ajustar-ventas 'NACHOS:+1,LOMO:-2'")
-        print("  python3 main.py --ajustar-registros 'LINEA|POLLO 160 gr CECAR|conteo=2|motivo=correccion'")
         print("  python3 main.py --registro-corregido 'LINEA|POLLO 160 gr CECAR|conteo=2'")
+        print("  python3 main.py --registro-corregido 'C1|FILETE DE POLLO 200 gr|salida=4'")
+        print("  python3 main.py --registro-corregido 'LINEA|PAN DE HOT DOG'   → Releer movimientos en MOTIVOS ESPECIALES")
+        print("  python3 main.py --registro-corregido 'LINEA|PAN DE CERVEZA|ingreso=0|sin-especiales'")
+        print("  python3 main.py --registro-corregido 'C2|CALAMAR 110 GR|salida=1|salida-especial=enviado a urdesa:1'")
         print("  python3 main.py <imagen> --fecha 2026-03-11   → Con fecha específica")
         sys.exit(1)
 
     requiere_anthropic = (
         "--solo-registros" not in sys.argv
         and "--ajustar-ventas" not in sys.argv
-        and "--ajustar-registros" not in sys.argv
         and "--registro-corregido" not in sys.argv
     )
     try:
@@ -220,7 +247,6 @@ def main():
 
     try:
         ajustes_ventas = _leer_ajustes_ventas(sys.argv)
-        ajustes_registros = _leer_cambios_registro(sys.argv, "--ajustar-registros")
         avisos_registro = _leer_cambios_registro(sys.argv, "--registro-corregido")
     except ValueError as e:
         print(f"❌ {str(e)}")
@@ -238,21 +264,6 @@ def main():
         else:
             _confirmar_interactivo(
                 lambda: confirmar_ajuste_ventas(prep, on_progress=_mostrar_progreso_usuario)
-            )
-        return
-
-    if ajustes_registros is not None:
-        fecha = _leer_fecha(sys.argv)
-        confirmar = "--confirmar" in sys.argv
-        prep = preparar_ajuste_registros(fecha=fecha, ajustes=ajustes_registros)
-        print(prep["resumen"])
-        if not prep["ok"]:
-            return
-        if confirmar:
-            print("\n" + confirmar_ajuste_registros(prep, on_progress=_mostrar_progreso_usuario))
-        else:
-            _confirmar_interactivo(
-                lambda: confirmar_ajuste_registros(prep, on_progress=_mostrar_progreso_usuario)
             )
         return
 

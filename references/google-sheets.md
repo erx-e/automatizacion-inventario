@@ -165,12 +165,18 @@ Reglas por ubicación:
 - `C1` y `C2`
   - `SALIDA = INICIO + INGRESO - CIERRE`
   - `DIF = SALIDA - VENTAS`
+  - la decisión de si el insumo se descuenta en el mismo congelador o en `LINEA` sale de `UBICACION DESCUENTO`
+  - si hay salida especial en `MOTIVOS ESPECIALES`, esa cantidad no se resta aparte en la fórmula; o se mantiene dentro de `VENTAS` del congelador o reduce el `INGRESO` hacia `LINEA`, según `UBICACION DESCUENTO`
 - `LINEA CALIENTE` con conteo
   - `SALIDA = INICIO + INGRESO - CIERRE`
-  - `DIF = SALIDA - VENTAS`
+  - `DIF = SALIDA_OPERATIVA - VENTAS`, donde `SALIDA_OPERATIVA = SALIDA - SALIDA_ESPECIAL`
 - `LINEA CALIENTE` sin conteo
-  - `SALIDA = INICIO + INGRESO - CIERRE - VENTAS`
-  - `DIF = 0`
+  - `VENTAS = VENTAS_TEORICAS + SALIDA_ESPECIAL`
+  - `SALIDA = INICIO + INGRESO - CIERRE`
+  - `DIF = SALIDA - VENTAS`
+  - `CIERRE` descuenta toda la salida real del día
+  - si existe `SALIDA_ESPECIAL`, queda reflejada tanto en `SALIDA` como en `VENTAS`
+  - si existe salida manual adicional sin `SALIDA_ESPECIAL`, esa parte sí aparece como diferencia real
 
 Regla crítica:
 
@@ -192,6 +198,16 @@ Cuando se crea el día sin ticket final:
 2. dejar `SALIDA` y `DIF` como fórmulas visibles
 3. en `C1` y `C2`, escribir `VENTAS` provisional desde `SALIDA`
 4. en `LINEA CALIENTE`, dejar `VENTAS` pendiente del ticket
+
+Regla de movimientos especiales:
+
+- el detalle de movimientos especiales ya no vive en los registros principales
+- la fuente de verdad es la hoja `MOTIVOS ESPECIALES`
+- la `SALIDA` total del registro principal ya incluye cualquier salida especial
+- el `INGRESO` total del registro principal ya incluye cualquier ingreso especial
+- si en `UBICACION DESCUENTO` el insumo se descuenta en `LINEA`, el `INGRESO` de línea se calcula con `SALIDA_TOTAL - SALIDA_ESPECIAL`
+- si en `UBICACION DESCUENTO` el insumo se descuenta en el mismo congelador, `VENTAS` del congelador usa `VENTAS_TEORICAS + SALIDA_ESPECIAL`
+- los ingresos especiales nunca se suman por encima del `INGRESO` total; son un subconjunto de ese total
 
 Regla crítica:
 
@@ -220,7 +236,6 @@ Usan bloques con:
 
 - `INGRESO`
 - `SALIDA`
-- `MOTIVO`
 
 ### `REGISTRO LINEA CALIENTE`
 
@@ -229,11 +244,32 @@ Usa bloques con:
 - `CONTEO`
 - `INGRESO`
 - `SALIDA`
-- `MOTIVO`
 
 Regla:
 
 - si el conteo de línea está vacío, significa "no contado", no `0`
+- cualquier detalle extraordinario se registra fuera de estas hojas, en `MOTIVOS ESPECIALES`
+
+### `MOTIVOS ESPECIALES`
+
+Usa filas simples con:
+
+- `FECHA`
+- `UBICACION`
+- `INSUMO`
+- `TIPO`
+- `MOTIVO`
+- `CANTIDAD`
+- `OBSERVACION` opcional
+
+Reglas:
+
+- `TIPO` solo puede ser `INGRESO` o `SALIDA`
+- `CANTIDAD` siempre debe ser positiva
+- la suma de ingresos especiales de un insumo nunca puede ser mayor que el `INGRESO` total de ese insumo en el registro principal
+- la suma de salidas especiales de un insumo nunca puede ser mayor que la salida total de ese insumo
+- si el insumo está en `LINEA` y usa conteo, la salida total válida se deriva de `INICIO + INGRESO - CIERRE`
+- el programa fusiona automáticamente `MOTIVOS ESPECIALES` con `REGISTRO C1`, `REGISTRO C2` y `REGISTRO LINEA CALIENTE` al leer el día
 
 ### Lectura robusta de registros
 
@@ -251,8 +287,15 @@ Esto evita perder fechas que queden más a la derecha del rango fijo y elimina e
 La tabla se usa para decidir:
 
 - ubicación de descuento por defecto de cada insumo
-- qué salidas de `C1` o `C2` deben entrar como ingresos en `LINEA CALIENTE`
+- qué parte de las salidas de `C1` o `C2` deben entrar como ingresos en `LINEA CALIENTE`
 - y también admite fallback por nombre normalizado cuando el texto no coincide exactamente
+
+Regla operativa:
+
+- si un insumo del congelador se descuenta en `LINEA`, solo la parte no especial de la salida se transfiere a línea
+- si un insumo del congelador se descuenta en el mismo congelador, la salida especial se suma a la venta esperada de ese congelador
+- en `LINEA` con conteo, la diferencia compara la salida operativa contra las ventas teóricas; la salida especial no debe generar una diferencia falsa
+- en panes o insumos de línea sin conteo, la salida especial ya queda absorbida dentro de la salida total y del cierre
 
 ## Verificaciones operativas
 

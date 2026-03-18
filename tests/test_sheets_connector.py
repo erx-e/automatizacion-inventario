@@ -43,6 +43,7 @@ config_stub.SHEET_INVENTARIO = "inventario"
 config_stub.HOJA_REGISTRO_C1 = "REGISTRO C1"
 config_stub.HOJA_REGISTRO_C2 = "REGISTRO C2"
 config_stub.HOJA_REGISTRO_LINEA = "REGISTRO LINEA CALIENTE"
+config_stub.HOJA_MOTIVOS_ESPECIALES = "MOTIVOS ESPECIALES"
 config_stub.HOJA_VENTAS_NEOLA = "VENTAS NEOLA"
 config_stub.HOJA_UBICACION = "UBICACION DESCUENTO"
 config_stub.HOJA_RECETAS = "RECETAS"
@@ -157,14 +158,14 @@ class LeerValoresHojaTests(unittest.TestCase):
 
 
 class ParsearRegistroRowsTests(unittest.TestCase):
-    def test_parsea_registro_c1_con_bloques_de_ingreso_salida_motivo(self):
+    def test_parsea_registro_c1_con_bloques_de_ingreso_y_salida(self):
         rows = [
             ["MARZO"],
-            ["REGISTRO C1", "", "10-03-2026", "", "", "11-03-2026"],
-            ["INSUMO", "UND", "INGRESO", "SALIDA", "MOTIVO", "INGRESO"],
+            ["REGISTRO C1", "", "10-03-2026", "", "11-03-2026"],
+            ["INSUMO", "UND", "INGRESO", "SALIDA", "INGRESO"],
             ["  RES"],
             ["POLLO 200 gr", "UND", "", "5", ""],
-            ["ALITAS 4 unid", "UND", "2", "1", "ajuste"],
+            ["ALITAS 4 unid", "UND", "2", "1", ""],
         ]
 
         registros = sheets_connector._parsear_registro_rows(rows, "2026-03-10")
@@ -173,13 +174,15 @@ class ParsearRegistroRowsTests(unittest.TestCase):
         self.assertEqual(registros["POLLO 200 gr"]["salida"], 5)
         self.assertEqual(registros["POLLO 200 gr"]["conteo"], None)
         self.assertEqual(registros["ALITAS 4 unid"]["ingreso"], 2)
-        self.assertEqual(registros["ALITAS 4 unid"]["motivo"], "ajuste")
+        self.assertEqual(registros["POLLO 200 gr"]["motivo"], "")
+        self.assertEqual(registros["ALITAS 4 unid"]["motivos_salida"], [])
+        self.assertEqual(registros["ALITAS 4 unid"]["motivos_ingreso"], [])
 
     def test_parsea_registro_linea_con_conteo(self):
         rows = [
             ["MARZO"],
-            ["REGISTRO LINEA CALIENTE", "", "10-03-2026", "", "", "", "11-03-2026"],
-            ["INSUMO", "UND", "CONTEO", "INGRESO", "SALIDA", "MOTIVO", "CONTEO"],
+            ["REGISTRO LINEA CALIENTE", "", "10-03-2026", "", "", "11-03-2026"],
+            ["INSUMO", "UND", "CONTEO", "INGRESO", "SALIDA", "CONTEO"],
             ["PAN DE SEMILLA NEGRA", "UND", "9", "", "", ""],
             ["PAN DE HOT DOG", "UND", "0", "10", "", ""],
         ]
@@ -194,7 +197,7 @@ class ParsearRegistroRowsTests(unittest.TestCase):
         rows = [
             ["MARZO"],
             ["REGISTRO LINEA CALIENTE", "", "10-03-2026"],
-            ["INSUMO", "UND", "CONTEO", "INGRESO", "SALIDA", "MOTIVO"],
+            ["INSUMO", "UND", "CONTEO", "INGRESO", "SALIDA"],
             ["PAN DE SEMILLA NEGRA", "UND", "", "12", "", ""],
         ]
 
@@ -202,6 +205,160 @@ class ParsearRegistroRowsTests(unittest.TestCase):
 
         self.assertIsNone(registros["PAN DE SEMILLA NEGRA"]["conteo"])
         self.assertEqual(registros["PAN DE SEMILLA NEGRA"]["ingreso"], 12)
+        self.assertEqual(registros["PAN DE SEMILLA NEGRA"]["motivo"], "")
+
+    def test_ignora_fila_sin_movimiento(self):
+        rows = [
+            ["MARZO"],
+            ["REGISTRO C1", "", "10-03-2026"],
+            ["INSUMO", "UND", "INGRESO", "SALIDA"],
+            ["POLLO 200 gr", "UND", "", ""],
+        ]
+
+        registros = sheets_connector._parsear_registro_rows(rows, "2026-03-10")
+
+        self.assertEqual(registros, {})
+
+    def test_parsea_insumos_registro_aun_sin_movimiento(self):
+        rows = [
+            ["MARZO"],
+            ["REGISTRO LINEA CALIENTE", "", "10-03-2026"],
+            ["INSUMO", "UND", "CONTEO", "INGRESO", "SALIDA"],
+            ["PAN DE CERVEZA", "UND", "", "", ""],
+            ["  PANES"],
+            ["PANINI (SANDUCHE- JAMON, PEPERONI)", "UND", "", "", ""],
+        ]
+
+        insumos = sheets_connector._parsear_insumos_registro_rows(rows, "2026-03-10")
+
+        self.assertEqual(
+            insumos,
+            ["PAN DE CERVEZA", "PANINI (SANDUCHE- JAMON, PEPERONI)"],
+        )
+
+
+class MotivosEspecialesTests(unittest.TestCase):
+    def test_parsea_y_agrupa_movimientos_especiales_por_tipo(self):
+        rows = [
+            ["FECHA", "UBICACION", "INSUMO", "TIPO", "MOTIVO", "CANTIDAD", "OBSERVACION"],
+            ["2026-03-10", "C1", "FILETE DE POLLO 200 gr", "SALIDA", "enviado a urdesa", "5", ""],
+            ["10-03-2026", "C1", "FILETE DE POLLO 200 gr", "INGRESO", "recibido de urdesa", "2", ""],
+            ["2026-03-10", "LINEA", "PAN DE HOT DOG", "SALIDA", "dado de baja", "1", "bolsa rota"],
+        ]
+
+        agregados = sheets_connector._parsear_motivos_especiales_rows(rows, "2026-03-10")
+
+        self.assertEqual(agregados["C1"]["FILETE DE POLLO 200 gr"]["cantidad_salida_especial"], 5)
+        self.assertEqual(agregados["C1"]["FILETE DE POLLO 200 gr"]["cantidad_ingreso_especial"], 2)
+        self.assertEqual(agregados["LINEA"]["PAN DE HOT DOG"]["motivos_salida"][0]["motivo"], "dado de baja")
+
+    def test_fusiona_motivos_especiales_en_registros(self):
+        registros = {
+            "C1": {
+                "FILETE DE POLLO 200 gr": {
+                    "conteo": None,
+                    "ingreso": 4,
+                    "salida": 15,
+                    "motivo": "",
+                    "cantidad": 0,
+                    "cantidad_ingreso_especial": 0,
+                    "cantidad_salida_especial": 0,
+                    "motivos_ingreso": [],
+                    "motivos_salida": [],
+                }
+            },
+            "C2": {},
+            "LINEA": {},
+        }
+        especiales = {
+            "C1": {
+                "FILETE DE POLLO 200 gr": {
+                    "cantidad_ingreso_especial": 2,
+                    "cantidad_salida_especial": 5,
+                    "motivos_ingreso": [{"motivo": "recibido de urdesa", "cantidad": 2, "observacion": ""}],
+                    "motivos_salida": [{"motivo": "enviado a urdesa", "cantidad": 5, "observacion": ""}],
+                }
+            },
+            "C2": {},
+            "LINEA": {},
+        }
+
+        fusionados = sheets_connector._fusionar_motivos_especiales_en_registros(registros, especiales)
+
+        self.assertEqual(fusionados["C1"]["FILETE DE POLLO 200 gr"]["cantidad_ingreso_especial"], 2)
+        self.assertEqual(fusionados["C1"]["FILETE DE POLLO 200 gr"]["cantidad_salida_especial"], 5)
+        self.assertEqual(fusionados["C1"]["FILETE DE POLLO 200 gr"]["motivo"], "enviado a urdesa")
+        self.assertEqual(fusionados["C1"]["FILETE DE POLLO 200 gr"]["cantidad"], 5)
+
+    def test_falla_si_ingreso_especial_supera_ingreso_total(self):
+        registros = {
+            "C1": {
+                "FILETE DE POLLO 200 gr": {
+                    "conteo": None,
+                    "ingreso": 1,
+                    "salida": 0,
+                    "motivo": "",
+                    "cantidad": 0,
+                    "cantidad_ingreso_especial": 0,
+                    "cantidad_salida_especial": 0,
+                    "motivos_ingreso": [],
+                    "motivos_salida": [],
+                }
+            },
+            "C2": {},
+            "LINEA": {},
+        }
+        especiales = {
+            "C1": {
+                "FILETE DE POLLO 200 gr": {
+                    "cantidad_ingreso_especial": 2,
+                    "cantidad_salida_especial": 0,
+                    "motivos_ingreso": [{"motivo": "recibido de urdesa", "cantidad": 2, "observacion": ""}],
+                    "motivos_salida": [],
+                }
+            },
+            "C2": {},
+            "LINEA": {},
+        }
+
+        with self.assertRaisesRegex(ValueError, "ingresos especiales"):
+            sheets_connector._fusionar_motivos_especiales_en_registros(registros, especiales)
+
+    def test_lee_motivos_especiales_solo_para_la_fecha_objetivo(self):
+        ws = types.SimpleNamespace(
+            title="MOTIVOS ESPECIALES",
+            col_values=mock.Mock(
+                return_value=[
+                    "FECHA",
+                    "2026-03-09",
+                    "2026-03-10",
+                    "2026-03-11",
+                    "10-03-2026",
+                ]
+            ),
+            batch_get=mock.Mock(
+                return_value=[
+                    [["2026-03-10", "C1", "FILETE DE POLLO 200 gr", "SALIDA", "enviado a urdesa", "5", ""]],
+                    [["10-03-2026", "LINEA", "PAN DE HOT DOG", "SALIDA", "dado de baja", "1", ""]],
+                ]
+            ),
+        )
+
+        with mock.patch.object(
+            sheets_connector,
+            "_obtener_worksheet_motivos_especiales",
+            return_value=ws,
+        ), mock.patch.object(
+            sheets_connector,
+            "_leer_valores_hoja",
+            return_value=[["FECHA", "UBICACION", "INSUMO", "TIPO", "MOTIVO", "CANTIDAD", "OBSERVACION"]],
+        ) as leer_mock:
+            agregados = sheets_connector.leer_motivos_especiales_dia("2026-03-10")
+
+        leer_mock.assert_called_once_with(ws, "A1:G1")
+        ws.batch_get.assert_called_once_with(["A3:G3", "A5:G5"])
+        self.assertEqual(agregados["C1"]["FILETE DE POLLO 200 gr"]["cantidad_salida_especial"], 5)
+        self.assertEqual(agregados["LINEA"]["PAN DE HOT DOG"]["cantidad_salida_especial"], 1)
 
 
 class LeerRegistroDiaTests(unittest.TestCase):
@@ -222,95 +379,6 @@ class LeerRegistroDiaTests(unittest.TestCase):
             (ws, f"A1:{gspread_stub.utils.rowcol_to_a1(200, 42)}"),
         )
         self.assertEqual(leer_mock.call_args.kwargs, {})
-
-
-class ActualizarRegistrosDiaTests(unittest.TestCase):
-    def test_actualiza_salida_y_motivo_en_c1(self):
-        class Worksheet:
-            def __init__(self):
-                self.row_count = 10
-                self.col_count = 8
-                self.title = "REGISTRO C1"
-
-        ws = Worksheet()
-        rows = [
-            ["MARZO"],
-            ["REGISTRO C1", "", "10-03-2026"],
-            ["INSUMO", "UND", "INGRESO", "SALIDA", "MOTIVO"],
-            ["FILETE DE POLLO 200 gr", "UND", "", "5", ""],
-        ]
-
-        with mock.patch.object(
-            sheets_connector,
-            "_obtener_worksheet",
-            return_value=ws,
-        ), mock.patch.object(
-            sheets_connector,
-            "_leer_valores_hoja",
-            return_value=rows,
-        ), mock.patch.object(
-            sheets_connector,
-            "_batch_update_user_entered",
-        ) as batch_mock:
-            actualizados = sheets_connector.actualizar_registros_dia(
-                "2026-03-10",
-                [{
-                    "ubicacion": "C1",
-                    "insumo": "FILETE DE POLLO 200 gr",
-                    "cambios": {"salida": 4, "motivo": "correccion"},
-                }],
-            )
-
-        self.assertEqual(actualizados, {"C1": ["FILETE DE POLLO 200 gr"], "C2": [], "LINEA": []})
-        self.assertEqual(
-            batch_mock.call_args.args[1],
-            [
-                {"range": "R4C4:R4C4", "values": [[4]]},
-                {"range": "R4C5:R4C5", "values": [["correccion"]]},
-            ],
-        )
-
-    def test_actualiza_conteo_en_linea(self):
-        class Worksheet:
-            def __init__(self):
-                self.row_count = 10
-                self.col_count = 8
-                self.title = "REGISTRO LINEA CALIENTE"
-
-        ws = Worksheet()
-        rows = [
-            ["MARZO"],
-            ["REGISTRO LINEA CALIENTE", "", "10-03-2026"],
-            ["INSUMO", "UND", "CONTEO", "INGRESO", "SALIDA", "MOTIVO"],
-            ["POLLO 160 gr CECAR", "UND", "3", "", "", ""],
-        ]
-
-        with mock.patch.object(
-            sheets_connector,
-            "_obtener_worksheet",
-            return_value=ws,
-        ), mock.patch.object(
-            sheets_connector,
-            "_leer_valores_hoja",
-            return_value=rows,
-        ), mock.patch.object(
-            sheets_connector,
-            "_batch_update_user_entered",
-        ) as batch_mock:
-            actualizados = sheets_connector.actualizar_registros_dia(
-                "2026-03-10",
-                [{
-                    "ubicacion": "LINEA",
-                    "insumo": "POLLO 160 gr CECAR",
-                    "cambios": {"conteo": 2},
-                }],
-            )
-
-        self.assertEqual(actualizados, {"C1": [], "C2": [], "LINEA": ["POLLO 160 gr CECAR"]})
-        self.assertEqual(
-            batch_mock.call_args.args[1],
-            [{"range": "R4C3:R4C3", "values": [[2]]}],
-        )
 
 
 class ScopedCacheSheetsTests(unittest.TestCase):
@@ -717,7 +785,7 @@ class InventarioHelpersTests(unittest.TestCase):
 
         self.assertEqual(
             fila,
-            [6, 12, "=R5C1+R5C2-R5C6-R5C5", "=0", 7, 9],
+            [6, 12, "=R5C1+R5C2-R5C6", "=R5C3-R5C5", 7, 9],
         )
 
 
@@ -736,6 +804,42 @@ class UserEnteredWriteTests(unittest.TestCase):
         sheets_connector._batch_update_user_entered(ws, payload)
 
         self.assertEqual(ws.calls, [{"data": payload, "raw": False}])
+
+
+class NotasInventarioTests(unittest.TestCase):
+    def test_nota_motivos_especiales_usa_observacion(self):
+        nota = sheets_connector._nota_motivos_especiales([
+            {"motivo": "enviado a urdesa", "cantidad": 5, "observacion": "pedido urgente"},
+            {"motivo": "dado de baja", "cantidad": 1, "observacion": "bolsa rota"},
+            {"motivo": "dado de baja", "cantidad": 2, "observacion": ""},
+        ])
+
+        self.assertEqual(
+            nota,
+            "enviado a urdesa (5): pedido urgente\ndado de baja (1): bolsa rota",
+        )
+
+    def test_requests_notas_movimientos_especiales_apunta_a_ingreso_y_salida(self):
+        ws = types.SimpleNamespace(id=77)
+        requests = sheets_connector._requests_notas_movimientos_especiales(
+            ws,
+            row=12,
+            col_destino=7,
+            registro={
+                "motivos_ingreso": [
+                    {"motivo": "recibido de urdesa", "cantidad": 3, "observacion": "traslado"},
+                ],
+                "motivos_salida": [
+                    {"motivo": "enviado a urdesa", "cantidad": 2, "observacion": "pedido urgente"},
+                ],
+            },
+        )
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]["repeatCell"]["range"]["startColumnIndex"], 7)
+        self.assertEqual(requests[1]["repeatCell"]["range"]["startColumnIndex"], 8)
+        self.assertEqual(requests[0]["repeatCell"]["cell"]["note"], "recibido de urdesa (3): traslado")
+        self.assertEqual(requests[1]["repeatCell"]["cell"]["note"], "enviado a urdesa (2): pedido urgente")
 
 
 class EscribirInventarioDiaTests(unittest.TestCase):
@@ -763,6 +867,7 @@ class EscribirInventarioDiaTests(unittest.TestCase):
         sh = types.SimpleNamespace(worksheet=lambda hoja_nombre: hojas[hoja_nombre])
         gc = types.SimpleNamespace(open_by_key=lambda key: sh)
         writes = []
+        notes = []
 
         with mock.patch.object(sheets_connector, "get_client", return_value=gc), mock.patch.object(
             sheets_connector,
@@ -788,6 +893,10 @@ class EscribirInventarioDiaTests(unittest.TestCase):
             sheets_connector,
             "_batch_update_user_entered",
             side_effect=lambda ws, data: writes.append((ws.title, data)),
+        ), mock.patch.object(
+            sheets_connector,
+            "_batch_update_notas",
+            side_effect=lambda ws, data: notes.append((ws.title, data)),
         ):
             sheets_connector.escribir_inventario_dia(
                 "2026-03-14",
@@ -798,6 +907,7 @@ class EscribirInventarioDiaTests(unittest.TestCase):
             )
 
         self.assertEqual(len(writes), 3)
+        self.assertEqual(len(notes), 3)
 
 
 class CorregirInventarioInsumosTests(unittest.TestCase):
@@ -848,6 +958,10 @@ class CorregirInventarioInsumosTests(unittest.TestCase):
             sheets_connector,
             "_batch_update_user_entered",
             side_effect=batch_update,
+        ), mock.patch.object(
+            sheets_connector,
+            "_batch_update_notas",
+            return_value=None,
         ):
             actualizados = sheets_connector.corregir_inventario_insumos(
                 "2026-03-14",

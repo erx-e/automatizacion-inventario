@@ -123,12 +123,12 @@ Usar cuando el usuario dice que el personal de cocina registró mal un dato, ya 
 - `conteo`
 - `ingreso`
 - `salida`
-- `motivo`
+- o movimientos ya corregidos en `MOTIVOS ESPECIALES`
 
 Secuencia:
 
 1. Leer registros actuales del día.
-2. Pedir al usuario un aviso claro con ubicación, columna, insumo y valor final.
+2. Pedir al usuario un aviso claro con ubicación, insumo y, si cambió el registro principal, columna y valor final.
 3. Confirmar que la edición manual ya se hizo en la hoja.
 4. Releer registros del día.
 5. Si ya hay ventas cargadas en `VENTAS NEOLA`, recalcular inventario con esas ventas actuales.
@@ -138,24 +138,37 @@ Secuencia:
 
 Formato recomendado para el aviso del usuario:
 
-- `Se corrigió el registro de {insumo} en {ubicacion}, columna {columna}, valor final {valor}.`
+- `UBICACION|INSUMO|campo=valor`
+- `UBICACION|INSUMO|sin-especiales`
+- `UBICACION|INSUMO|campo=valor|sin-especiales`
+- `UBICACION|INSUMO|campo=valor|ingreso-especial=motivo:cantidad`
+- `UBICACION|INSUMO|campo=valor|salida-especial=motivo:cantidad`
+- varios avisos en un mensaje: separar con `;`
 
 Ejemplos:
 
-- `Se corrigió el registro de POLLO 160 gr CECAR en LINEA, columna conteo, valor final 2.`
-- `Se corrigió el registro de FILETE DE POLLO 200 gr en C1, columna salida, valor final 4.`
-- `Se corrigió el registro de KLOBASA DE PRAGA en C2, columna motivo, valor final traslado a linea.`
+- `LINEA|POLLO 160 gr CECAR|conteo=2`
+- `C1|FILETE DE POLLO 200 gr|salida=4`
+- `LINEA|PAN DE CERVEZA|ingreso=0|sin-especiales`
+- `C2|CALAMAR 110 GR|salida=1|sin-especiales`
+- `LINEA|PAN DE HOT DOG|ingreso=5|ingreso-especial=recibido de urdesa:2`
 
-Campos permitidos:
+Campos permitidos en el registro principal:
 
-- `C1` y `C2`: `ingreso`, `salida`, `motivo`
-- `LINEA CALIENTE`: `conteo`, `ingreso`, `salida`, `motivo`
+- `C1` y `C2`: `ingreso`, `salida`
+- `LINEA CALIENTE`: `conteo`, `ingreso`, `salida`
 
 Reglas de conversación:
 
 - si el usuario dice solo `congelador`, pedir que especifique `C1` o `C2`
-- si el aviso no incluye ubicación, columna, insumo y valor final, pedir únicamente lo que falte
+- si el aviso no incluye ubicación, insumo y, cuando aplique, columna y valor final, pedir únicamente lo que falte
+- si el usuario quiere borrar todos los movimientos especiales de un insumo para ese día, pedir `sin-especiales`
 - OpenClaw no debe editar la hoja de registros: solo releerla después de la corrección manual
+- los movimientos especiales ya no viven en los registros principales; se leen desde `MOTIVOS ESPECIALES`
+- en `MOTIVOS ESPECIALES`, `TIPO=INGRESO` o `TIPO=SALIDA`
+- la suma de ingresos especiales nunca puede ser mayor que el `INGRESO` total del registro principal
+- la suma de salidas especiales nunca puede ser mayor que la salida total del insumo
+- al releer registros del día, también se debe releer `MOTIVOS ESPECIALES`
 
 ## Regla de fecha
 
@@ -271,13 +284,16 @@ Excepción:
 
 #### En cierre final o flujos incrementales
 
-- si el insumo se descuenta en el mismo congelador, `VENTAS_FINAL = max(consumo_teórico, SALIDA registrada)`
-- si el insumo se descuenta en `LINEA`, `VENTAS_FINAL = SALIDA registrada`
+- la decisión sale de `UBICACION DESCUENTO`
+- si en `UBICACION DESCUENTO` el insumo se descuenta en el mismo congelador, `VENTAS_FINAL = VENTAS_TEORICAS + SALIDA_ESPECIAL`
+- si en `UBICACION DESCUENTO` el insumo se descuenta en `LINEA`, `VENTAS_FINAL = SALIDA registrada`
 - esto permite cubrir:
   - ventas normales de Neola
   - salidas directas para preparar un plato
   - transferencias a línea
 - regla crítica: no duplicar insumos cuando primero hubo salida manual y luego llegó el ticket
+- si existe salida especial en el congelador, esa cantidad no entra a `LINEA` como ingreso
+- si el insumo va directo a plato, `VENTAS_FINAL = VENTAS_TEORICAS + SALIDA_ESPECIAL`
 
 En la hoja diaria:
 
@@ -290,6 +306,7 @@ Esto evita perder salidas reales del congelador y evita duplicar consumo cuando 
 
 - `INGRESO` = ingreso registrado en línea + transferencias desde `C1/C2`.
 - Una transferencia existe cuando un insumo salió de `C1/C2` y en `UBICACION DESCUENTO` su `DESCUENTO POR DEFECTO` es `LINEA`.
+- Si en el congelador hubo una salida especial registrada en `MOTIVOS ESPECIALES`, esa cantidad no se transfiere a línea.
 - `VENTAS`:
   - en "solo registros", dejarla pendiente del ticket
   - en cierre final o flujo incremental, usar el consumo teórico que corresponde a línea
@@ -298,7 +315,7 @@ Esto evita perder salidas reales del congelador y evita duplicar consumo cuando 
 
 - `CIERRE` = conteo registrado.
 - `SALIDA` = `INICIO + INGRESO - CIERRE`
-- `DIF` = `SALIDA - VENTAS`
+- `DIF` = `SALIDA_OPERATIVA - VENTAS`, donde `SALIDA_OPERATIVA = SALIDA - SALIDA_ESPECIAL`
 
 En la hoja diaria:
 
@@ -307,14 +324,17 @@ En la hoja diaria:
 #### Cuando no hay conteo
 
 - se usa para items no contados diariamente, como panes
-- `SALIDA` = solo la salida extraordinaria registrada manualmente
-- `CIERRE` = `INICIO + INGRESO - SALIDA - VENTAS`
-- `DIF` = `0`
+- `VENTAS = VENTAS_TEORICAS + SALIDA_ESPECIAL`
+- `SALIDA = INICIO + INGRESO - CIERRE`
+- `DIF = SALIDA - VENTAS`
+- `CIERRE` descuenta toda la salida real del día
+- si existe `SALIDA_ESPECIAL`, queda reflejada tanto en `SALIDA` como en `VENTAS`
+- si existe salida manual adicional sin `SALIDA_ESPECIAL`, esa parte sí aparece como diferencia real
 
 En la hoja diaria:
 
-- `SALIDA` se escribe como fórmula visible a partir de `INICIO`, `INGRESO`, `CIERRE` y `VENTAS`
-- `DIF` se deja en fórmula constante `0`
+- `SALIDA` se deja escrita como fórmula visible estándar
+- `DIF` se deja escrita como fórmula visible estándar
 
 ## Regla especial de panes
 
@@ -322,8 +342,8 @@ En la hoja diaria:
 - Si el conteo está vacío, no convertirlo a `0`.
 - Deben reflejar solo:
   - `INGRESO`
-  - `SALIDA` extraordinaria, si existe
-  - `VENTAS` teóricas del día
+  - `SALIDA` total del día, incluyendo `SALIDA_ESPECIAL` si existe
+  - `VENTAS` teóricas del día + `SALIDA_ESPECIAL`
   - `CIERRE` calculado desde el cierre anterior
 
 ## Validación y seguridad

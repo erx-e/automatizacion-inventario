@@ -25,7 +25,7 @@ from sheets_connector import (
     leer_registros_dia_completo, escribir_ventas_neola,
     escribir_inventario_dia, leer_diferencias_inventario_dia,
     corregir_inventario_insumos, verificar_inventario_dia_existe,
-    leer_ventas_neola_dia, actualizar_registros_dia,
+    leer_ventas_neola_dia, leer_insumos_registro_dia_completo,
 )
 
 # Zona horaria de Ecuador (UTC-5)
@@ -571,6 +571,14 @@ def _ctx_get_registros(contexto: dict | None, fecha: str) -> dict:
     )
 
 
+def _ctx_get_insumos_registro(contexto: dict | None, fecha: str) -> dict:
+    return _ctx_get(
+        contexto,
+        ("insumos_registro", fecha),
+        lambda: leer_insumos_registro_dia_completo(fecha, cache=_ctx_sheets_cache(contexto)),
+    )
+
+
 def _ctx_get_ventas_neola(contexto: dict | None, fecha: str) -> list[dict]:
     return _ctx_get(
         contexto,
@@ -604,97 +612,62 @@ def _registro_vacio(ubicacion_key: str) -> dict:
         "ingreso": 0,
         "salida": 0,
         "motivo": "",
-    }
-
-
-def _copiar_registros(registros: dict) -> dict:
-    return {
-        ubicacion: {
-            insumo: dict(datos)
-            for insumo, datos in (registros.get(ubicacion, {}) or {}).items()
-        }
-        for ubicacion in ("C1", "C2", "LINEA")
+        "cantidad": 0,
+        "cantidad_ingreso_especial": 0,
+        "cantidad_salida_especial": 0,
+        "motivos_ingreso": [],
+        "motivos_salida": [],
     }
 
 
 def _valor_registro_para_mostrar(campo: str, valor):
     if campo == "motivo":
-        return valor if str(valor).strip() else "vacío"
+        return valor if str(valor).strip() else "Sin motivo"
     if campo == "conteo":
         return "vacío" if valor is None else valor
     return valor
 
 
-def _aplicar_ajustes_registros(registros_actuales: dict, ajustes: list[dict]) -> tuple[dict, list[dict]]:
-    nuevos = _copiar_registros(registros_actuales)
-    cambios = []
-
-    for ajuste in ajustes:
-        ubicacion_key = _normalizar_ubicacion_registro(ajuste.get("ubicacion"))
-        if ubicacion_key not in nuevos:
-            raise ValueError(f"Ubicación de registro no válida: {ajuste.get('ubicacion')}")
-
-        insumo = str(ajuste.get("insumo", "")).strip()
-        if not insumo:
-            raise ValueError("Cada ajuste de registro debe indicar un insumo.")
-
-        actual = dict(nuevos[ubicacion_key].get(insumo) or _registro_vacio(ubicacion_key))
-        antes = dict(actual)
-
-        for campo, valor in ajuste.get("cambios", {}).items():
-            if campo == "conteo" and ubicacion_key != "LINEA":
-                raise ValueError(f"'{insumo}' en {ubicacion_key} no usa conteo.")
-            if campo not in ("conteo", "ingreso", "salida", "motivo"):
-                raise ValueError(f"Campo de registro no válido: {campo}")
-
-            if campo == "motivo":
-                actual[campo] = str(valor).strip()
-                continue
-
-            if valor is None:
-                actual[campo] = None if campo == "conteo" else 0
-                continue
-
-            numero = int(valor)
-            if numero < 0:
-                raise ValueError(f"El ajuste deja '{insumo}' con {campo} negativo ({numero}).")
-            actual[campo] = numero
-
-        if (
-            actual.get("conteo") is None
-            and actual.get("ingreso", 0) == 0
-            and actual.get("salida", 0) == 0
-            and not actual.get("motivo", "")
-        ):
-            nuevos[ubicacion_key].pop(insumo, None)
-        else:
-            nuevos[ubicacion_key][insumo] = actual
-
-        cambios.append({
-            "ubicacion": ubicacion_key,
-            "insumo": insumo,
-            "antes": antes,
-            "despues": dict(nuevos[ubicacion_key].get(insumo) or _registro_vacio(ubicacion_key)),
-        })
-
-    return nuevos, cambios
+def _normalizar_motivo_registro(valor) -> str:
+    texto = str(valor or "").strip()
+    if not texto:
+        return ""
+    if normalizar_nombre(texto) == normalizar_nombre("Sin motivo"):
+        return ""
+    return texto
 
 
-def _formatear_cambios_registro(cambios: list[dict]) -> list[str]:
-    lineas = []
-    for cambio in cambios:
-        hoja = "LINEA CALIENTE" if cambio["ubicacion"] == "LINEA" else cambio["ubicacion"]
-        lineas.append(f"   • {hoja} / {cambio['insumo']}")
-        for campo in ("conteo", "ingreso", "salida", "motivo"):
-            antes = cambio["antes"].get(campo)
-            despues = cambio["despues"].get(campo)
-            if antes == despues:
-                continue
-            lineas.append(
-                f"      - {campo}: {_valor_registro_para_mostrar(campo, antes)} → "
-                f"{_valor_registro_para_mostrar(campo, despues)}"
-            )
-    return lineas
+def _cantidad_motivo_registro(registro: dict) -> int:
+    if not registro:
+        return 0
+    if "cantidad_salida_especial" in registro:
+        return int(registro.get("cantidad_salida_especial", 0) or 0)
+    if not registro.get("motivo"):
+        return 0
+    return int(registro.get("cantidad", 0) or 0)
+
+
+def _cantidad_ingreso_especial_registro(registro: dict) -> int:
+    if not registro:
+        return 0
+    return int(registro.get("cantidad_ingreso_especial", 0) or 0)
+
+
+def _motivos_ingreso_registro(registro: dict) -> list[dict]:
+    if not registro:
+        return []
+    return list(registro.get("motivos_ingreso") or [])
+
+
+def _motivos_salida_registro(registro: dict) -> list[dict]:
+    if not registro:
+        return []
+    return list(registro.get("motivos_salida") or [])
+
+
+def _salida_operativa_registro(registro: dict) -> int:
+    salida = int((registro or {}).get("salida", 0) or 0)
+    return max(salida - _cantidad_motivo_registro(registro), 0)
 
 
 def _resolver_insumo_en_registros(registros_ubicacion: dict, insumo: str) -> str | None:
@@ -705,7 +678,40 @@ def _resolver_insumo_en_registros(registros_ubicacion: dict, insumo: str) -> str
     return None
 
 
-def _verificar_avisos_registros(registros_actuales: dict, avisos: list[dict]) -> tuple[list[dict], list[dict]]:
+def _resolver_insumo_en_lista(insumos: list[str], insumo: str) -> str | None:
+    objetivo = normalizar_nombre(str(insumo or ""))
+    for nombre_real in insumos or []:
+        if normalizar_nombre(nombre_real) == objetivo:
+            return nombre_real
+    return None
+
+
+def _agrupar_motivos_para_comparar(motivos: list[dict]) -> list[dict]:
+    acumulado = {}
+    for item in motivos or []:
+        motivo = str(item.get("motivo", "") or "").strip()
+        if not motivo:
+            continue
+        clave = normalizar_nombre(motivo)
+        acumulado[clave] = {
+            "motivo": motivo,
+            "cantidad": int(acumulado.get(clave, {}).get("cantidad", 0) or 0) + int(item.get("cantidad", 0) or 0),
+        }
+    return sorted(acumulado.values(), key=lambda item: normalizar_nombre(item["motivo"]))
+
+
+def _describir_motivos_para_usuario(motivos: list[dict]) -> str:
+    agrupados = _agrupar_motivos_para_comparar(motivos)
+    if not agrupados:
+        return "sin movimientos especiales"
+    return ", ".join(
+        f"{item['motivo']} ({item['cantidad']})"
+        for item in agrupados
+    )
+
+
+def _verificar_avisos_registros(registros_actuales: dict, avisos: list[dict],
+                                insumos_disponibles: dict | None = None) -> tuple[list[dict], list[dict]]:
     confirmados = []
     diferencias = []
 
@@ -719,6 +725,12 @@ def _verificar_avisos_registros(registros_actuales: dict, avisos: list[dict]) ->
             raise ValueError("Cada aviso de registro corregido debe indicar un insumo.")
 
         nombre_real = _resolver_insumo_en_registros(registros_actuales.get(ubicacion_key, {}), insumo)
+        if nombre_real is None:
+            nombre_real = _resolver_insumo_en_lista((insumos_disponibles or {}).get(ubicacion_key, []), insumo)
+        if nombre_real is None:
+            raise ValueError(
+                f"No encontré '{insumo}' en {ubicacion_key} para revisar la corrección manual."
+            )
         actual = dict(
             (registros_actuales.get(ubicacion_key, {}) or {}).get(nombre_real)
             or _registro_vacio(ubicacion_key)
@@ -728,12 +740,10 @@ def _verificar_avisos_registros(registros_actuales: dict, avisos: list[dict]) ->
         for campo, valor_esperado in aviso.get("cambios", {}).items():
             if campo == "conteo" and ubicacion_key != "LINEA":
                 raise ValueError(f"'{insumo}' en {ubicacion_key} no usa conteo.")
-            if campo not in ("conteo", "ingreso", "salida", "motivo"):
+            if campo not in ("conteo", "ingreso", "salida"):
                 raise ValueError(f"Campo de registro no válido: {campo}")
 
-            if campo == "motivo":
-                esperado = str(valor_esperado).strip()
-            elif valor_esperado is None:
+            if valor_esperado is None:
                 esperado = None if campo == "conteo" else 0
             else:
                 esperado = int(valor_esperado)
@@ -749,6 +759,7 @@ def _verificar_avisos_registros(registros_actuales: dict, avisos: list[dict]) ->
 
             if valor_actual != esperado:
                 diferencias.append({
+                    "tipo": "campo",
                     "ubicacion": ubicacion_key,
                     "insumo": nombre_real or insumo,
                     "campo": campo,
@@ -756,10 +767,43 @@ def _verificar_avisos_registros(registros_actuales: dict, avisos: list[dict]) ->
                     "esperado": esperado,
                 })
 
+        verificar_especiales = bool(aviso.get("verificar_especiales"))
+        motivos_ingreso_actuales = _motivos_ingreso_registro(actual)
+        motivos_salida_actuales = _motivos_salida_registro(actual)
+        if verificar_especiales:
+            esperado_ingreso = _agrupar_motivos_para_comparar(aviso.get("motivos_ingreso_esperados") or [])
+            esperado_salida = _agrupar_motivos_para_comparar(aviso.get("motivos_salida_esperados") or [])
+            actual_ingreso = _agrupar_motivos_para_comparar(motivos_ingreso_actuales)
+            actual_salida = _agrupar_motivos_para_comparar(motivos_salida_actuales)
+
+            if actual_ingreso != esperado_ingreso:
+                diferencias.append({
+                    "tipo": "especiales",
+                    "ubicacion": ubicacion_key,
+                    "insumo": nombre_real or insumo,
+                    "campo": "movimientos especiales de ingreso",
+                    "actual": _describir_motivos_para_usuario(actual_ingreso),
+                    "esperado": _describir_motivos_para_usuario(esperado_ingreso),
+                })
+            if actual_salida != esperado_salida:
+                diferencias.append({
+                    "tipo": "especiales",
+                    "ubicacion": ubicacion_key,
+                    "insumo": nombre_real or insumo,
+                    "campo": "movimientos especiales de salida",
+                    "actual": _describir_motivos_para_usuario(actual_salida),
+                    "esperado": _describir_motivos_para_usuario(esperado_salida),
+                })
+
         confirmados.append({
             "ubicacion": ubicacion_key,
             "insumo": nombre_real or insumo,
             "campos": cambios_confirmados,
+            "motivos_ingreso": motivos_ingreso_actuales,
+            "motivos_salida": motivos_salida_actuales,
+            "verificar_especiales": verificar_especiales,
+            "motivos_ingreso_esperados": aviso.get("motivos_ingreso_esperados") or [],
+            "motivos_salida_esperados": aviso.get("motivos_salida_esperados") or [],
         })
 
     return confirmados, diferencias
@@ -770,6 +814,25 @@ def _formatear_confirmaciones_registro(confirmados: list[dict]) -> list[str]:
     for confirmado in confirmados:
         hoja = "LINEA CALIENTE" if confirmado["ubicacion"] == "LINEA" else confirmado["ubicacion"]
         lineas.append(f"   • {hoja} / {confirmado['insumo']}")
+        if confirmado.get("verificar_especiales"):
+            ingreso_esperado = _describir_motivos_para_usuario(confirmado.get("motivos_ingreso_esperados") or [])
+            salida_esperada = _describir_motivos_para_usuario(confirmado.get("motivos_salida_esperados") or [])
+            lineas.append(f"      - ingreso especial esperado: {ingreso_esperado}")
+            lineas.append(f"      - salida especial esperada: {salida_esperada}")
+        elif not confirmado["campos"]:
+            especiales = []
+            for item in confirmado.get("motivos_ingreso", []):
+                especiales.append(
+                    f"ingreso especial {item.get('motivo')} ({int(item.get('cantidad', 0) or 0)})"
+                )
+            for item in confirmado.get("motivos_salida", []):
+                especiales.append(
+                    f"salida especial {item.get('motivo')} ({int(item.get('cantidad', 0) or 0)})"
+                )
+            if especiales:
+                lineas.append(f"      - movimientos especiales actuales: {', '.join(especiales)}")
+            else:
+                lineas.append("      - releeré los movimientos especiales actuales de este insumo.")
         for campo in confirmado["campos"]:
             lineas.append(
                 f"      - {campo['campo']}: "
@@ -782,6 +845,12 @@ def _formatear_diferencias_aviso_registro(diferencias: list[dict]) -> list[str]:
     lineas = []
     for item in diferencias:
         hoja = "LINEA CALIENTE" if item["ubicacion"] == "LINEA" else item["ubicacion"]
+        if item.get("tipo") == "especiales":
+            lineas.append(
+                f"   • {hoja} / {item['insumo']} / {item['campo']}: "
+                f"en la hoja veo {item['actual']} y me indicaste {item['esperado']}"
+            )
+            continue
         lineas.append(
             f"   • {hoja} / {item['insumo']} / {item['campo']}: "
             f"en la hoja veo {_valor_registro_para_mostrar(item['campo'], item['actual'])} "
@@ -1148,12 +1217,12 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
         consumo_teorico = datos["total"]
         ubicacion_defecto = ubicaciones_defecto.get(insumo, datos["ubicacion"])
 
-        salida_c1 = registros["C1"].get(insumo, {}).get("salida", 0)
-        salida_c2 = registros["C2"].get(insumo, {}).get("salida", 0)
+        salida_c1 = _salida_operativa_registro(registros["C1"].get(insumo, {}))
+        salida_c2 = _salida_operativa_registro(registros["C2"].get(insumo, {}))
         salida_total_cong = salida_c1 + salida_c2
 
         datos_linea = registros["LINEA"].get(insumo, {})
-        salida_linea = datos_linea.get("salida", 0)
+        salida_linea = _salida_operativa_registro(datos_linea)
 
         if ubicacion_defecto == "LINEA":
             salida_registrada = salida_linea
@@ -1183,13 +1252,21 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
 
     for ubicacion, reg in registros.items():
         for insumo, datos_reg in reg.items():
-            if datos_reg["motivo"]:
+            for item in _motivos_ingreso_registro(datos_reg):
                 movimientos_extraordinarios.append({
                     "insumo": insumo,
                     "ubicacion": ubicacion,
-                    "ingreso": datos_reg["ingreso"],
-                    "salida": datos_reg["salida"],
-                    "motivo": datos_reg["motivo"]
+                    "tipo": "Ingreso",
+                    "cantidad": int(item.get("cantidad", 0) or 0),
+                    "motivo": item.get("motivo", ""),
+                })
+            for item in _motivos_salida_registro(datos_reg):
+                movimientos_extraordinarios.append({
+                    "insumo": insumo,
+                    "ubicacion": ubicacion,
+                    "tipo": "Salida",
+                    "cantidad": int(item.get("cantidad", 0) or 0),
+                    "motivo": item.get("motivo", ""),
                 })
 
     # Escribir en Google Sheets
@@ -1215,6 +1292,7 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
                 modo_ventas="final_ticket",
                 cache=sheets_cache,
             )
+            _emitir_progreso(on_progress, "Estoy terminando de guardar el inventario.")
             reporte.append("✅ Inventario diario actualizado")
         except Exception as e:
             reporte.append(_formatear_error_usuario("⚠️ Error al guardar inventario", e))
@@ -1241,7 +1319,7 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
             reporte.append(f"   • {insumo}: {datos['total']} {datos['unidad']}")
 
     try:
-        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        _emitir_progreso(on_progress, "Estoy verificando que todo haya quedado cuadrado.")
         diferencias_finales = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
     except Exception as e:
         diferencias_finales = None
@@ -1264,9 +1342,11 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
                         f"INGRESO={item['ingreso']}, SALIDA={item['salida']}, "
                         f"DIF={signo}{item['dif']}, VENTAS={item['ventas']}, CIERRE={item['cierre']}"
                     )
-                    diagnostico = _diagnosticar_diferencia_inventario(hoja, item)
-                    if diagnostico:
-                        reporte.append(f"     Posible causa: {diagnostico}")
+                    diagnosticos = _diagnosticar_diferencia_inventario(hoja, item)
+                    if diagnosticos:
+                        reporte.append("     Posibles causas:")
+                        for diagnostico in diagnosticos:
+                            reporte.append(f"       {diagnostico}")
         else:
             reporte.append("\n✅ Sin diferencias finales en C1, C2 y LINEA CALIENTE")
     elif descuadres:
@@ -1283,10 +1363,8 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
     if movimientos_extraordinarios:
         reporte.append(f"\n📝 Movimientos extraordinarios ({len(movimientos_extraordinarios)}):")
         for m in movimientos_extraordinarios:
-            tipo = "Ingreso" if m["ingreso"] else "Salida"
-            cant = m["ingreso"] or m["salida"]
             reporte.append(
-                f"   • {m['insumo']} ({m['ubicacion']}): {tipo} {cant} — {m['motivo']}"
+                f"   • {m['insumo']} ({m['ubicacion']}): {m['tipo']} {m['cantidad']} — {m['motivo']}"
             )
 
     if alertas_recetas:
@@ -1427,60 +1505,75 @@ def _formatear_diferencias_inventario(diferencias: dict) -> list[str]:
                     f"SALIDA={item['salida']}, DIF={signo}{item['dif']}, "
                     f"VENTAS={item['ventas']}, CIERRE={item['cierre']}"
                 )
-                diagnostico = _diagnosticar_diferencia_inventario(hoja, item)
-                if diagnostico:
-                    lineas.append(f"    Posible causa: {diagnostico}")
+                diagnosticos = _diagnosticar_diferencia_inventario(hoja, item)
+                if diagnosticos:
+                    lineas.append("    Posibles causas:")
+                    for diagnostico in diagnosticos:
+                        lineas.append(f"      {diagnostico}")
     else:
         lineas.append("\nSin diferencias en C1, C2 y LINEA CALIENTE.")
     return lineas
 
 
-def _diagnosticar_diferencia_inventario(hoja: str, item: dict) -> str:
+def _diagnosticar_diferencia_inventario(hoja: str, item: dict) -> list[str]:
     dif = int(item.get("dif", 0) or 0)
     ventas = int(item.get("ventas", 0) or 0)
     salida = int(item.get("salida", 0) or 0)
 
     if dif == 0:
-        return ""
+        return []
 
     if ventas > 0 and salida == 0:
         if hoja == "LINEA CALIENTE":
-            return (
-                "Neola reporta ventas, pero no hubo rebaja visible en linea. "
-                "Revisa conteo final, faltó registrar una salida o la receta."
-            )
-        return (
-            "Neola reporta ventas, pero no hubo salida registrada. "
-            "Revisa registro de salida, ubicacion del insumo o receta."
-        )
+            return [
+                "Alta probabilidad: el conteo final quedó mayor al real o faltó registrar la salida del congelador que debía alimentar a línea.",
+                "Media probabilidad: faltó registrar una transferencia o ingreso hacia línea.",
+                "Baja probabilidad: la receta descuenta de más o el insumo está mal asociado.",
+            ]
+        return [
+            "Alta probabilidad: faltó registrar una salida en el congelador.",
+            "Media probabilidad: la salida real quedó en otra ubicación o hubo un error del personal de salón al registrar una venta de más en Neola.",
+            "Baja probabilidad: la receta descuenta de más o el insumo está mal ubicado.",
+        ]
 
     if salida > 0 and ventas == 0:
-        return (
-            "Hubo salida o uso sin venta en Neola. "
-            "Revisa merma, produccion interna, salida manual o un ticket faltante."
-        )
+        if hoja == "LINEA CALIENTE":
+            return [
+                "Alta probabilidad: faltó una venta o un ticket en Neola, o hubo una salida real en línea sin marcar un motivo especial.",
+                "Media probabilidad: el conteo final quedó menor al real.",
+                "Baja probabilidad: la receta descuenta menos de lo que realmente se usa o el insumo está mal asociado.",
+            ]
+        return [
+            "Alta probabilidad: hubo una salida real sin venta respaldada o falta un ticket.",
+            "Media probabilidad: el insumo salió por producción interna o fue dado de baja por mal estado; eso solo suele confirmarse con un conteo físico.",
+            "Baja probabilidad: el insumo está mal ubicado o la receta corresponde a otro insumo.",
+        ]
 
     if dif > 0:
         if hoja == "LINEA CALIENTE":
-            return (
-                "Se rebajo mas en linea de lo que Neola vende. "
-                "Revisa conteo final, salidas manuales o una receta cargada de mas."
-            )
-        return (
-            "Se saco mas del congelador de lo que Neola vende. "
-            "Revisa salida registrada, transferencias a linea o receta cargada de mas."
-        )
+            return [
+                "Alta probabilidad: el conteo final quedó menor al real o faltó registrar un motivo especial en LINEA CALIENTE.",
+                "Media probabilidad: falta una venta o un ticket en Neola.",
+                "Baja probabilidad: la receta descuenta menos de lo que realmente se usa o el insumo está mal asociado.",
+            ]
+        return [
+            "Alta probabilidad: se sacó más del congelador de lo que quedó respaldado por ventas o transferencias.",
+            "Media probabilidad: falta un ticket, una transferencia a línea o un conteo físico que permita detectar una cantidad especial no marcada.",
+            "Baja probabilidad: la receta descuenta menos de lo que realmente se usa o el insumo está mal asociado.",
+        ]
 
     if hoja == "LINEA CALIENTE":
-        return (
-            "Neola vende mas de lo rebajado en linea. "
-            "Revisa conteo final, faltó registrar una salida o la receta podria estar incompleta."
-        )
+        return [
+            "Alta probabilidad: el conteo final quedó mayor al real o faltó registrar una salida del congelador que debía alimentar a línea.",
+            "Media probabilidad: falta registrar una transferencia o ingreso hacia línea, o hubo un error del personal de salón al registrar una venta de más en Neola.",
+            "Baja probabilidad: la receta descuenta de más o el insumo está mal asociado.",
+        ]
 
-    return (
-        "Neola vende mas de lo sacado del congelador. "
-        "Revisa la salida registrada, la ubicacion del insumo o una venta faltante en el registro."
-    )
+    return [
+        "Alta probabilidad: faltó registrar una salida en el congelador.",
+        "Media probabilidad: la salida real quedó en otra ubicación o hubo un error del personal de salón al registrar una venta de más en Neola.",
+        "Baja probabilidad: la receta descuenta de más o el insumo está mal asociado.",
+    ]
 
 
 def _verificar_entrada_inventario(fecha: str, contexto: dict | None = None) -> tuple[bool, str]:
@@ -1649,6 +1742,7 @@ def _confirmar_actualizacion_ventas(
                 modo_ventas="final_ticket",
                 cache=sheets_cache,
             )
+            _emitir_progreso(on_progress, "Estoy terminando de guardar el inventario.")
         except Exception as e:
             return _formatear_error_usuario("❌ Ventas actualizadas, pero falló la actualización completa del inventario", e)
     elif preparacion["insumos_afectados"]:
@@ -1662,6 +1756,7 @@ def _confirmar_actualizacion_ventas(
                 preparacion["ubicaciones"],
                 cache=sheets_cache,
             )
+            _emitir_progreso(on_progress, "Estoy terminando de guardar el inventario.")
         except Exception as e:
             return _formatear_error_usuario("❌ Ventas actualizadas, pero falló la corrección de inventario", e)
 
@@ -1669,7 +1764,7 @@ def _confirmar_actualizacion_ventas(
         _guardar_imagen_cierre(fecha, image_path=image_path, image_bytes=image_bytes)
 
     try:
-        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        _emitir_progreso(on_progress, "Estoy verificando que todo haya quedado cuadrado.")
         diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
         advertencia_diferencias = ""
     except Exception as e:
@@ -1823,187 +1918,6 @@ def confirmar_ajuste_ventas(preparacion: dict, contexto: dict | None = None,
     )
 
 
-# ============================================================
-# Ajuste de registros del día
-# ============================================================
-
-def preparar_ajuste_registros(fecha: str = None, ajustes: list[dict] | None = None,
-                              contexto: dict | None = None) -> dict:
-    contexto = _normalizar_contexto(contexto)
-    if not ajustes:
-        return {"ok": False, "resumen": "❌ Debes indicar al menos un ajuste de registro."}
-
-    if not fecha:
-        fecha = sugerir_fecha()[0]
-
-    try:
-        registros_actuales = _ctx_get_registros(contexto, fecha)
-        ventas_actuales = _ctx_get_ventas_neola(contexto, fecha)
-        ubicaciones = _ctx_get_ubicaciones(contexto)
-    except Exception as e:
-        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer datos del día", e)}
-
-    try:
-        registros_finales, cambios = _aplicar_ajustes_registros(registros_actuales, ajustes)
-    except ValueError as e:
-        return {"ok": False, "resumen": f"❌ {str(e)}"}
-
-    modo_ventas = "final_ticket" if ventas_actuales else "provisional_registros"
-    total_ventas = sum(venta.get("cantidad", 0) or 0 for venta in ventas_actuales)
-    recetas = []
-    consumo = []
-    consumo_agrupado = {}
-    alertas = []
-    if ventas_actuales:
-        try:
-            recetas = _ctx_get_recetas(contexto)
-        except Exception as e:
-            return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer recetas", e)}
-
-        datos = _preparar_datos_cierre(
-            ventas_actuales,
-            fecha,
-            recetas,
-            registros=registros_finales,
-        )
-        consumo = datos["consumo"]
-        consumo_agrupado = datos["consumo_agrupado"]
-        alertas = datos["alertas"]
-
-    lineas = [f"🛠️ AJUSTE DE REGISTROS — {fecha}", "=" * 40]
-    lineas.append(f"\nCambios a aplicar ({len(cambios)}):")
-    lineas.extend(_formatear_cambios_registro(cambios))
-
-    if ventas_actuales:
-        lineas.append("")
-        lineas.append(
-            f"Después de corregir los registros, se resincronizará el inventario usando "
-            f"las ventas ya cargadas ({total_ventas} unidades)."
-        )
-    else:
-        lineas.append("")
-        lineas.append("Todavía no hay ventas cargadas para ese día.")
-        lineas.append("El inventario se volverá a calcular solo desde registros.")
-        lineas.append("LINEA CALIENTE seguirá pendiente del ticket final.")
-
-    if alertas:
-        lineas.append("\n⚠️ Alertas:")
-        for alerta in alertas:
-            lineas.append(f"   {alerta}")
-
-    lineas.append(f"\n{'=' * 40}")
-    lineas.append(_mensaje_cuidado_hojas())
-    lineas.append("¿Todo correcto? ¿Aplico la corrección del registro?")
-
-    return {
-        "ok": True,
-        "fecha": fecha,
-        "ajustes": ajustes,
-        "cambios": cambios,
-        "registros_finales": registros_finales,
-        "ventas_actuales": ventas_actuales,
-        "consumo_agrupado": consumo_agrupado,
-        "ubicaciones": ubicaciones,
-        "modo_ventas": modo_ventas,
-        "resumen": "\n".join(lineas),
-    }
-
-
-def confirmar_ajuste_registros(preparacion: dict, contexto: dict | None = None,
-                               on_progress=None) -> str:
-    fecha = preparacion["fecha"]
-    contexto = _normalizar_contexto(contexto)
-    sheets_cache = _ctx_sheets_cache(contexto)
-
-    try:
-        _emitir_progreso(on_progress, "Estoy actualizando los registros del día.")
-        actualizados = actualizar_registros_dia(fecha, preparacion["ajustes"], cache=sheets_cache)
-    except Exception as e:
-        return _formatear_error_usuario("❌ Error al actualizar los registros", e)
-
-    try:
-        registros_actualizados = leer_registros_dia_completo(fecha)
-        ventas_actuales = leer_ventas_neola_dia(fecha)
-        ubicaciones = leer_ubicacion_descuento()
-    except Exception as e:
-        return _formatear_error_usuario("❌ Registros actualizados, pero no se pudieron releer los datos", e)
-
-    modo_ventas = "final_ticket" if ventas_actuales else "provisional_registros"
-    consumo_agrupado = {}
-    if ventas_actuales:
-        try:
-            recetas = leer_recetas()
-            datos = _preparar_datos_cierre(
-                ventas_actuales,
-                fecha,
-                recetas,
-                registros=registros_actualizados,
-            )
-            consumo_agrupado = datos["consumo_agrupado"]
-        except Exception as e:
-            return _formatear_error_usuario("❌ Registros actualizados, pero falló el recálculo de consumo", e)
-
-    try:
-        _emitir_progreso(on_progress, "Estoy actualizando el inventario con los registros corregidos.")
-        escribir_inventario_dia(
-            fecha,
-            consumo_agrupado,
-            registros_actualizados,
-            ubicaciones,
-            modo_ventas=modo_ventas,
-            cache=sheets_cache,
-        )
-    except Exception as e:
-        return _formatear_error_usuario("❌ Registros actualizados, pero falló la actualización del inventario", e)
-
-    try:
-        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
-        diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
-        advertencia = ""
-    except Exception as e:
-        diferencias = {"C1": [], "C2": [], "LINEA CALIENTE": []}
-        advertencia = _formatear_error_usuario("⚠️ No se pudieron leer las diferencias finales del inventario", e)
-
-    historial_previo = _leer_historial_cierre(fecha) or {}
-    metadata_historial = dict(historial_previo.get("metadata") or {})
-    metadata_historial["origen"] = "ajuste_registros"
-    if ventas_actuales:
-        _guardar_historial_cierre(
-            fecha,
-            ventas_actuales,
-            consumo_agrupado,
-            diferencias,
-            metadata=metadata_historial,
-        )
-
-    lineas = [f"✅ REGISTROS ACTUALIZADOS — {fecha}", "=" * 40]
-    total_ajustes = sum(len(items) for items in actualizados.values())
-    lineas.append(f"\nRegistros corregidos ({total_ajustes}):")
-    for hoja in ("C1", "C2", "LINEA"):
-        items = actualizados.get(hoja, [])
-        if not items:
-            continue
-        hoja_nombre = "LINEA CALIENTE" if hoja == "LINEA" else hoja
-        lineas.append(f"   • {hoja_nombre}: {', '.join(items)}")
-
-    if ventas_actuales:
-        total_ventas = sum(venta.get("cantidad", 0) or 0 for venta in ventas_actuales)
-        lineas.append(
-            f"\nInventario resincronizado con las ventas ya cargadas ({total_ventas} unidades)."
-        )
-    else:
-        lineas.append("\nInventario recalculado solo desde registros.")
-        lineas.append("LINEA CALIENTE sigue pendiente del ticket final.")
-
-    if advertencia:
-        lineas.append("")
-        lineas.append(advertencia)
-    lineas.extend(_formatear_diferencias_inventario(diferencias))
-    lineas.append("")
-    lineas.append(_recordatorio_edicion_manual())
-    return "\n".join(lineas)
-
-
 def preparar_registro_corregido(fecha: str = None, avisos: list[dict] | None = None,
                                 contexto: dict | None = None) -> dict:
     contexto = _normalizar_contexto(contexto)
@@ -2014,13 +1928,14 @@ def preparar_registro_corregido(fecha: str = None, avisos: list[dict] | None = N
         fecha = sugerir_fecha()[0]
 
     try:
-        registros_actuales = leer_registros_dia_completo(fecha)
-        ventas_actuales = leer_ventas_neola_dia(fecha)
+        registros_actuales = _ctx_get_registros(contexto, fecha)
+        insumos_registro = _ctx_get_insumos_registro(contexto, fecha)
+        ventas_actuales = _ctx_get_ventas_neola(contexto, fecha)
     except Exception as e:
         return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer datos del día", e)}
 
     try:
-        confirmados, diferencias_aviso = _verificar_avisos_registros(registros_actuales, avisos)
+        confirmados, diferencias_aviso = _verificar_avisos_registros(registros_actuales, avisos, insumos_disponibles=insumos_registro)
     except ValueError as e:
         return {"ok": False, "resumen": f"❌ {str(e)}"}
 
@@ -2085,6 +2000,7 @@ def preparar_registro_corregido(fecha: str = None, avisos: list[dict] | None = N
         "avisos": avisos,
         "ventas_actuales": ventas_actuales,
         "registros_actuales": registros_actuales,
+        "insumos_registro": insumos_registro,
         "consumo_agrupado": consumo_agrupado,
         "modo_ventas": modo_ventas,
         "resumen": "\n".join(lineas),
@@ -2100,10 +2016,12 @@ def confirmar_registro_corregido(preparacion: dict, contexto: dict | None = None
     try:
         _emitir_progreso(on_progress, "Estoy releyendo los registros corregidos.")
         registros_actualizados = leer_registros_dia_completo(fecha)
+        insumos_registro = leer_insumos_registro_dia_completo(fecha)
         ventas_actuales = leer_ventas_neola_dia(fecha)
         confirmados, diferencias_aviso = _verificar_avisos_registros(
             registros_actualizados,
             preparacion["avisos"],
+            insumos_disponibles=insumos_registro,
         )
     except Exception as e:
         return _formatear_error_usuario("❌ Error al releer los registros corregidos", e)
@@ -2140,11 +2058,12 @@ def confirmar_registro_corregido(preparacion: dict, contexto: dict | None = None
             modo_ventas=modo_ventas,
             cache=sheets_cache,
         )
+        _emitir_progreso(on_progress, "Estoy terminando de guardar el inventario.")
     except Exception as e:
         return _formatear_error_usuario("❌ La corrección manual se leyó, pero falló la actualización del inventario", e)
 
     try:
-        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        _emitir_progreso(on_progress, "Estoy verificando que todo haya quedado cuadrado.")
         diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
         advertencia = ""
     except Exception as e:
@@ -2231,13 +2150,25 @@ def preparar_inventario_registros(fecha: str = None, contexto: dict | None = Non
                 partes.append(f"salida={datos['salida']}")
             if datos.get("conteo") is not None:
                 partes.append(f"conteo={datos['conteo']}")
-            if datos.get("motivo"):
-                partes.append(f"motivo: {datos['motivo']}")
+            if _motivos_ingreso_registro(datos):
+                resumen = ", ".join(
+                    f"{item.get('motivo')} ({int(item.get('cantidad', 0) or 0)})"
+                    for item in _motivos_ingreso_registro(datos)
+                )
+                partes.append(f"ingresos especiales: {resumen}")
+            if _motivos_salida_registro(datos):
+                resumen = ", ".join(
+                    f"{item.get('motivo')} ({int(item.get('cantidad', 0) or 0)})"
+                    for item in _motivos_salida_registro(datos)
+                )
+                partes.append(f"salidas especiales: {resumen}")
             lineas.append(f"   • {insumo}: {', '.join(partes)}")
 
     lineas.append(f"\n{'=' * 40}")
     lineas.append(f"Se crearán las entradas del {fecha} en C1, C2 y LINEA CALIENTE.")
     lineas.append("En C1 y C2, VENTAS provisional se llenará desde SALIDA registrada.")
+    lineas.append("Los movimientos especiales se leerán desde MOTIVOS ESPECIALES.")
+    lineas.append("Si un insumo se descuenta en LINEA según UBICACION DESCUENTO, la salida especial solo reduce el INGRESO que pasa a línea.")
     lineas.append("LINEA CALIENTE quedará pendiente del ticket para completar VENTAS.")
     lineas.append(_mensaje_cuidado_hojas())
     lineas.append("\n¿Todo correcto? ¿Procedo?")
@@ -2270,11 +2201,12 @@ def confirmar_inventario_registros(preparacion: dict, contexto: dict | None = No
             modo_ventas="provisional_registros",
             cache=sheets_cache,
         )
+        _emitir_progreso(on_progress, "Estoy terminando de guardar el inventario.")
     except Exception as e:
         return _formatear_error_usuario("❌ Error al escribir inventario", e)
 
     try:
-        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        _emitir_progreso(on_progress, "Estoy verificando que todo haya quedado cuadrado.")
         diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
         advertencia_diferencias = ""
     except Exception as e:
@@ -2284,6 +2216,7 @@ def confirmar_inventario_registros(preparacion: dict, contexto: dict | None = No
     lineas = [f"✅ INVENTARIO CREADO — {fecha}"]
     lineas.append("Entradas creadas en C1, C2 y LINEA CALIENTE.")
     lineas.append("C1 y C2 quedaron con VENTAS provisional desde SALIDA registrada.")
+    lineas.append("Las transferencias a LINEA y las salidas directas a plato se seguirán distinguiendo según UBICACION DESCUENTO.")
     lineas.append("LINEA CALIENTE sigue pendiente del ticket para completar VENTAS.")
     if advertencia_diferencias:
         lineas.append(advertencia_diferencias)
@@ -2443,7 +2376,8 @@ def corregir_inventario_por_insumos(image_path: str = None, image_bytes: bytes =
             ubicaciones,
             cache=_ctx_sheets_cache(contexto),
         )
-        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        _emitir_progreso(on_progress, "Estoy terminando de guardar el inventario.")
+        _emitir_progreso(on_progress, "Estoy verificando que todo haya quedado cuadrado.")
         diferencias = leer_diferencias_inventario_dia(fecha, cache=_ctx_sheets_cache(contexto))
     except Exception as e:
         return _formatear_error_usuario("❌ Error al corregir inventario puntual", e)

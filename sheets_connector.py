@@ -6,7 +6,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from config import (
     GOOGLE_CREDENTIALS_PATH, SHEET_REGISTROS, SHEET_RECETAS, SHEET_INVENTARIO,
-    HOJA_REGISTRO_C1, HOJA_REGISTRO_C2, HOJA_REGISTRO_LINEA,
+    HOJA_REGISTRO_C1, HOJA_REGISTRO_C2, HOJA_REGISTRO_LINEA, HOJA_MOTIVOS_ESPECIALES,
     HOJA_VENTAS_NEOLA, HOJA_UBICACION, HOJA_RECETAS,
     SHEETS_WRITE_DELAY_SECONDS,
 )
@@ -409,6 +409,48 @@ def _tiene_dato(raw: str) -> bool:
     return bool(str(raw).strip())
 
 
+def _motivo_especial_registro(raw: str) -> str:
+    texto = str(raw or "").strip()
+    if not texto:
+        return ""
+    if _normalizar_nombre_insumo(texto) == _normalizar_nombre_insumo("Sin motivo"):
+        return ""
+    return texto
+
+
+def _cantidad_motivo_registro(registro: dict) -> int:
+    if not registro:
+        return 0
+    if "cantidad_salida_especial" in registro:
+        return int(registro.get("cantidad_salida_especial", 0) or 0)
+    if not registro.get("motivo"):
+        return 0
+    return int(registro.get("cantidad", 0) or 0)
+
+
+def _cantidad_ingreso_especial_registro(registro: dict) -> int:
+    if not registro:
+        return 0
+    return int(registro.get("cantidad_ingreso_especial", 0) or 0)
+
+
+def _motivos_salida_registro(registro: dict) -> list[dict]:
+    if not registro:
+        return []
+    return list(registro.get("motivos_salida") or [])
+
+
+def _motivos_ingreso_registro(registro: dict) -> list[dict]:
+    if not registro:
+        return []
+    return list(registro.get("motivos_ingreso") or [])
+
+
+def _salida_operativa_registro(registro: dict) -> int:
+    salida = int((registro or {}).get("salida", 0) or 0)
+    return max(salida - _cantidad_motivo_registro(registro or {}), 0)
+
+
 # ============================================================
 # LECTURA DE REGISTROS DIARIOS
 # ============================================================
@@ -443,17 +485,15 @@ def _parsear_registro_rows(rows: list[list[str]], fecha: str) -> dict:
             conteo_raw = row[col_base] if col_base < len(row) else ""
             ingreso_raw = row[col_base + 1] if (col_base + 1) < len(row) else ""
             salida_raw = row[col_base + 2] if (col_base + 2) < len(row) else ""
-            motivo = row[col_base + 3] if (col_base + 3) < len(row) else ""
         else:
             conteo_raw = ""
             ingreso_raw = row[col_base] if col_base < len(row) else ""
             salida_raw = row[col_base + 1] if (col_base + 1) < len(row) else ""
-            motivo = row[col_base + 2] if (col_base + 2) < len(row) else ""
+        salida = _parsear_numero(salida_raw)
 
         tiene_movimiento = any([
             _tiene_dato(ingreso_raw),
             _tiene_dato(salida_raw),
-            _tiene_dato(motivo),
             modo_linea and _tiene_dato(conteo_raw),
         ])
         if not tiene_movimiento:
@@ -462,11 +502,271 @@ def _parsear_registro_rows(rows: list[list[str]], fecha: str) -> dict:
         registros[insumo] = {
             "conteo": _parsear_numero(conteo_raw) if modo_linea and _tiene_dato(conteo_raw) else None,
             "ingreso": _parsear_numero(ingreso_raw),
-            "salida": _parsear_numero(salida_raw),
-            "motivo": str(motivo).strip(),
+            "salida": salida,
+            "motivo": "",
+            "cantidad": 0,
+            "cantidad_ingreso_especial": 0,
+            "cantidad_salida_especial": 0,
+            "motivos_ingreso": [],
+            "motivos_salida": [],
         }
 
     return registros
+
+
+def _parsear_insumos_registro_rows(rows: list[list[str]], fecha: str) -> list[str]:
+    if len(rows) < 3:
+        return []
+
+    fechas_row = rows[1]
+    headers_row = rows[2]
+    col_base = None
+    for idx, valor in enumerate(fechas_row):
+        if _fecha_especial_coincide(valor, fecha):
+            col_base = idx
+            break
+
+    if col_base is None:
+        return []
+
+    insumos = []
+    for raw_row in rows[3:]:
+        row = list(raw_row)
+        insumo_raw = row[0] if row and row[0] else ""
+        if not insumo_raw or insumo_raw.startswith(" "):
+            continue
+        insumo = insumo_raw.strip()
+        if insumo:
+            insumos.append(insumo)
+    return insumos
+
+
+def _normalizar_ubicacion_especial(raw: str) -> str:
+    texto = _normalizar_nombre_insumo(raw or "")
+    if texto == "LINEA CALIENTE":
+        return "LINEA"
+    if texto in {"C1", "C2", "LINEA"}:
+        return texto
+    raise ValueError(f"Ubicación especial no válida: {raw}")
+
+
+def _fecha_especial_coincide(raw: str, fecha: str) -> bool:
+    texto = str(raw or "").strip()
+    if not texto:
+        return False
+    base = texto.split()[0]
+    candidatos = {
+        fecha,
+        _fecha_a_display(fecha),
+        fecha.replace("-", "/"),
+        _fecha_a_display(fecha).replace("-", "/"),
+    }
+    return base in candidatos
+
+
+def _resumen_motivos_especiales(motivos: list[dict]) -> tuple[str, int]:
+    if not motivos:
+        return "", 0
+    cantidad_total = sum(int(item.get("cantidad", 0) or 0) for item in motivos)
+    motivos_unicos = []
+    vistos = set()
+    for item in motivos:
+        motivo = str(item.get("motivo", "")).strip()
+        if not motivo:
+            continue
+        clave = _normalizar_nombre_insumo(motivo)
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        motivos_unicos.append(motivo)
+    if len(motivos_unicos) == 1:
+        return motivos_unicos[0], cantidad_total
+    return "varios motivos", cantidad_total
+
+
+def _rangos_filas_contiguas(filas: list[int]) -> list[tuple[int, int]]:
+    if not filas:
+        return []
+    filas_ordenadas = sorted(set(filas))
+    rangos = []
+    inicio = filas_ordenadas[0]
+    fin = inicio
+    for fila in filas_ordenadas[1:]:
+        if fila == fin + 1:
+            fin = fila
+            continue
+        rangos.append((inicio, fin))
+        inicio = fin = fila
+    rangos.append((inicio, fin))
+    return rangos
+
+
+def _leer_rows_motivos_especiales_dia(ws, fecha: str) -> list[list[str]]:
+    header = _leer_valores_hoja(ws, "A1:G1")
+    if not header:
+        return []
+
+    fechas = _ejecutar_con_retry_sheets(
+        lambda: ws.col_values(1),
+        operacion=f"leer columna FECHA de {_nombre_ws(ws)}",
+    )
+    filas_objetivo = [
+        idx
+        for idx, valor in enumerate(fechas[1:], start=2)
+        if _fecha_especial_coincide(valor, fecha)
+    ]
+    if not filas_objetivo:
+        return header
+
+    rangos = [
+        f"A{inicio}:G{fin}"
+        for inicio, fin in _rangos_filas_contiguas(filas_objetivo)
+    ]
+
+    bloques = []
+    if hasattr(ws, "batch_get"):
+        try:
+            bloques = _ejecutar_con_retry_sheets(
+                lambda: ws.batch_get(rangos),
+                operacion=f"leer filas filtradas de {_nombre_ws(ws)}",
+            )
+        except TypeError:
+            bloques = []
+
+    if not bloques:
+        bloques = [_leer_valores_hoja(ws, rango) for rango in rangos]
+
+    rows = list(header)
+    for bloque in bloques:
+        rows.extend(bloque or [])
+    return rows
+
+
+def _parsear_motivos_especiales_rows(rows: list[list[str]], fecha: str) -> dict:
+    if not rows:
+        return {"C1": {}, "C2": {}, "LINEA": {}}
+
+    headers = {
+        _normalizar_nombre_insumo(cell): idx
+        for idx, cell in enumerate(rows[0])
+        if str(cell or "").strip()
+    }
+    requeridos = {"FECHA", "UBICACION", "INSUMO", "TIPO", "MOTIVO", "CANTIDAD"}
+    if not requeridos.issubset(headers):
+        return {"C1": {}, "C2": {}, "LINEA": {}}
+
+    agregados = {"C1": {}, "C2": {}, "LINEA": {}}
+    for row in rows[1:]:
+        fecha_raw = row[headers["FECHA"]] if headers["FECHA"] < len(row) else ""
+        if not _fecha_especial_coincide(fecha_raw, fecha):
+            continue
+
+        ubicacion_raw = row[headers["UBICACION"]] if headers["UBICACION"] < len(row) else ""
+        insumo_raw = row[headers["INSUMO"]] if headers["INSUMO"] < len(row) else ""
+        tipo_raw = row[headers["TIPO"]] if headers["TIPO"] < len(row) else ""
+        motivo_raw = row[headers["MOTIVO"]] if headers["MOTIVO"] < len(row) else ""
+        cantidad_raw = row[headers["CANTIDAD"]] if headers["CANTIDAD"] < len(row) else ""
+        observacion_raw = row[headers.get("OBSERVACION", -1)] if headers.get("OBSERVACION", -1) < len(row) and headers.get("OBSERVACION", -1) >= 0 else ""
+
+        if not any(_tiene_dato(val) for val in (ubicacion_raw, insumo_raw, tipo_raw, motivo_raw, cantidad_raw, observacion_raw)):
+            continue
+
+        ubicacion = _normalizar_ubicacion_especial(ubicacion_raw)
+        insumo = str(insumo_raw or "").strip()
+        tipo = _normalizar_nombre_insumo(tipo_raw)
+        motivo = _motivo_especial_registro(motivo_raw)
+        cantidad = _parsear_numero(cantidad_raw)
+        observacion = str(observacion_raw or "").strip()
+
+        if not insumo:
+            raise ValueError("Hay un movimiento especial sin insumo.")
+        if tipo not in {"SALIDA", "INGRESO"}:
+            raise ValueError(f"'{insumo}' tiene un tipo especial no válido: {tipo_raw}")
+        if not motivo:
+            raise ValueError(f"'{insumo}' tiene un movimiento especial sin motivo.")
+        if cantidad <= 0:
+            raise ValueError(f"'{insumo}' tiene un movimiento especial sin cantidad válida.")
+
+        bucket = agregados[ubicacion].setdefault(insumo, {
+            "cantidad_ingreso_especial": 0,
+            "cantidad_salida_especial": 0,
+            "motivos_ingreso": [],
+            "motivos_salida": [],
+        })
+        item = {"motivo": motivo, "cantidad": cantidad, "observacion": observacion}
+        if tipo == "INGRESO":
+            bucket["cantidad_ingreso_especial"] += cantidad
+            bucket["motivos_ingreso"].append(item)
+        else:
+            bucket["cantidad_salida_especial"] += cantidad
+            bucket["motivos_salida"].append(item)
+
+    return agregados
+
+
+def _obtener_worksheet_motivos_especiales():
+    errores = []
+    for hoja in (HOJA_MOTIVOS_ESPECIALES, "SALIDAS ESPECIALES"):
+        try:
+            return _obtener_worksheet(SHEET_REGISTROS, hoja)
+        except Exception as exc:
+            errores.append(exc)
+    raise errores[-1]
+
+
+def leer_motivos_especiales_dia(fecha: str, cache: dict | None = None) -> dict:
+    def cargar():
+        try:
+            ws = _obtener_worksheet_motivos_especiales()
+        except gspread.exceptions.WorksheetNotFound:
+            return {"C1": {}, "C2": {}, "LINEA": {}}
+
+        rows = _leer_rows_motivos_especiales_dia(ws, fecha)
+        return _parsear_motivos_especiales_rows(rows, fecha)
+
+    return _cache_get(cache, ("motivos_especiales_dia", fecha), cargar)
+
+
+def _fusionar_motivos_especiales_en_registros(registros: dict, especiales: dict) -> dict:
+    resultado = {
+        ubicacion: {
+            insumo: dict(datos)
+            for insumo, datos in (registros.get(ubicacion, {}) or {}).items()
+        }
+        for ubicacion in ("C1", "C2", "LINEA")
+    }
+
+    for ubicacion in ("C1", "C2", "LINEA"):
+        for insumo, datos_especiales in (especiales.get(ubicacion, {}) or {}).items():
+            nombre_real = _resolver_clave_mapa(resultado.get(ubicacion, {}), insumo)
+            if nombre_real is None:
+                raise ValueError(
+                    f"'{insumo}' tiene movimientos especiales en {ubicacion}, pero no existe en el registro principal del día."
+                )
+
+            registro = dict(resultado[ubicacion][nombre_real])
+            ingreso_especial = int(datos_especiales.get("cantidad_ingreso_especial", 0) or 0)
+            salida_especial = int(datos_especiales.get("cantidad_salida_especial", 0) or 0)
+
+            if ingreso_especial > int(registro.get("ingreso", 0) or 0):
+                raise ValueError(
+                    f"'{nombre_real}' tiene ingresos especiales ({ingreso_especial}) mayores que el ingreso total ({registro.get('ingreso', 0)}) en {ubicacion}."
+                )
+            if (ubicacion != "LINEA" or registro.get("conteo") is None) and salida_especial > int(registro.get("salida", 0) or 0):
+                raise ValueError(
+                    f"'{nombre_real}' tiene salidas especiales ({salida_especial}) mayores que la salida total ({registro.get('salida', 0)}) en {ubicacion}."
+                )
+
+            registro["cantidad_ingreso_especial"] = ingreso_especial
+            registro["cantidad_salida_especial"] = salida_especial
+            registro["motivos_ingreso"] = list(datos_especiales.get("motivos_ingreso") or [])
+            registro["motivos_salida"] = list(datos_especiales.get("motivos_salida") or [])
+            motivo_resumen, cantidad_resumen = _resumen_motivos_especiales(registro["motivos_salida"])
+            registro["motivo"] = motivo_resumen
+            registro["cantidad"] = cantidad_resumen
+            resultado[ubicacion][nombre_real] = registro
+
+    return resultado
 
 
 def leer_registro_dia(hoja_nombre: str, fecha: str, cache: dict | None = None) -> dict:
@@ -485,15 +785,46 @@ def leer_registro_dia(hoja_nombre: str, fecha: str, cache: dict | None = None) -
     )
 
 
+def leer_insumos_registro_dia(hoja_nombre: str, fecha: str, cache: dict | None = None) -> list[str]:
+    def cargar():
+        ws = _obtener_worksheet(SHEET_REGISTROS, hoja_nombre)
+        rows = _leer_valores_hoja(
+            ws,
+            f"A1:{gspread.utils.rowcol_to_a1(ws.row_count, ws.col_count)}",
+        )
+        return _parsear_insumos_registro_rows(rows, fecha)
+
+    return _cache_get(
+        cache,
+        ("insumos_registro_dia", hoja_nombre, fecha),
+        cargar,
+    )
+
+
+def leer_insumos_registro_dia_completo(fecha: str, cache: dict | None = None) -> dict:
+    return _cache_get(
+        cache,
+        ("insumos_registro_completos", fecha),
+        lambda: {
+            "C1": leer_insumos_registro_dia(HOJA_REGISTRO_C1, fecha, cache=cache),
+            "C2": leer_insumos_registro_dia(HOJA_REGISTRO_C2, fecha, cache=cache),
+            "LINEA": leer_insumos_registro_dia(HOJA_REGISTRO_LINEA, fecha, cache=cache),
+        },
+    )
+
+
 def leer_registros_dia_completo(fecha: str, cache: dict | None = None) -> dict:
     return _cache_get(
         cache,
         ("registros_completos", fecha),
-        lambda: {
-            "C1": leer_registro_dia(HOJA_REGISTRO_C1, fecha, cache=cache),
-            "C2": leer_registro_dia(HOJA_REGISTRO_C2, fecha, cache=cache),
-            "LINEA": leer_registro_dia(HOJA_REGISTRO_LINEA, fecha, cache=cache),
-        },
+        lambda: _fusionar_motivos_especiales_en_registros(
+            {
+                "C1": leer_registro_dia(HOJA_REGISTRO_C1, fecha, cache=cache),
+                "C2": leer_registro_dia(HOJA_REGISTRO_C2, fecha, cache=cache),
+                "LINEA": leer_registro_dia(HOJA_REGISTRO_LINEA, fecha, cache=cache),
+            },
+            leer_motivos_especiales_dia(fecha, cache=cache),
+        ),
     )
 
 
@@ -523,86 +854,6 @@ def _contexto_registro_dia(ws, fecha: str, cache: dict | None = None) -> tuple[i
         return col_base + 1, modo_linea, rows
 
     return _cache_get(cache, ("registro", "contexto_dia", ws.title, fecha), cargar)
-
-
-def _columnas_campos_registro(col_base: int, modo_linea: bool) -> dict[str, int]:
-    if modo_linea:
-        return {
-            "conteo": col_base,
-            "ingreso": col_base + 1,
-            "salida": col_base + 2,
-            "motivo": col_base + 3,
-        }
-
-    return {
-        "ingreso": col_base,
-        "salida": col_base + 1,
-        "motivo": col_base + 2,
-    }
-
-
-def _buscar_fila_insumo_registro(rows: list[list[str]], insumo: str) -> int | None:
-    mapa_filas = {}
-    for idx, row in enumerate(rows[3:], start=4):
-        insumo_raw = row[0] if row and row[0] else ""
-        if not insumo_raw or insumo_raw.startswith(" "):
-            continue
-        mapa_filas[str(insumo_raw).strip()] = idx
-
-    clave_real = _resolver_clave_mapa(mapa_filas, insumo)
-    if clave_real is None:
-        return None
-    return mapa_filas[clave_real]
-
-
-def actualizar_registros_dia(fecha: str, ajustes: list[dict], cache: dict | None = None) -> dict[str, list[str]]:
-    hojas = {
-        "C1": HOJA_REGISTRO_C1,
-        "C2": HOJA_REGISTRO_C2,
-        "LINEA": HOJA_REGISTRO_LINEA,
-    }
-    actualizados = {clave: [] for clave in hojas}
-
-    for ubicacion_key, hoja_nombre in hojas.items():
-        ajustes_hoja = [ajuste for ajuste in ajustes if ajuste["ubicacion"] == ubicacion_key]
-        if not ajustes_hoja:
-            continue
-
-        ws = _obtener_worksheet(SHEET_REGISTROS, hoja_nombre)
-        col_base, modo_linea, rows = _contexto_registro_dia(ws, fecha, cache=cache)
-        columnas = _columnas_campos_registro(col_base, modo_linea)
-
-        updates = []
-        for ajuste in ajustes_hoja:
-            fila = _buscar_fila_insumo_registro(rows, ajuste["insumo"])
-            if fila is None:
-                raise ValueError(f"No encontré '{ajuste['insumo']}' en {hoja_nombre}.")
-
-            for campo, valor in ajuste["cambios"].items():
-                if campo not in columnas:
-                    raise ValueError(f"'{campo}' no se puede ajustar en {hoja_nombre}.")
-
-                col = columnas[campo]
-                updates.append({
-                    "range": (
-                        f"{gspread.utils.rowcol_to_a1(fila, col)}:"
-                        f"{gspread.utils.rowcol_to_a1(fila, col)}"
-                    ),
-                    "values": [[valor]],
-                })
-
-            actualizados[ubicacion_key].append(ajuste["insumo"])
-
-        if updates:
-            _batch_update_user_entered(ws, updates)
-            _cache_invalidate(
-                cache,
-                ("registro_dia", hoja_nombre, fecha),
-                ("registros_completos", fecha),
-                ("registro", "contexto_dia", ws.title, fecha),
-            )
-
-    return actualizados
 
 
 # ============================================================
@@ -1157,20 +1408,21 @@ def _ventas_esperadas_para_hoja(ubicacion_key: str, insumo: str, consumo_por_hoj
                                 modo_ventas: str = "final_ticket") -> int:
     ventas_neola = _obtener_valor_mapa(consumo_por_hoja.get(ubicacion_key, {}), insumo, 0)
     registro = _obtener_valor_mapa(registros.get(ubicacion_key, {}), insumo, {})
-    salida_registrada = registro.get("salida", 0) if registro else 0
+    salida_total = int(registro.get("salida", 0) or 0) if registro else 0
+    cantidad_especial = _cantidad_motivo_registro(registro) if registro else 0
 
     if modo_ventas == "provisional_registros":
         if ubicacion_key in ("C1", "C2"):
-            return salida_registrada
+            return salida_total
         return 0
 
     if ubicacion_key in ("C1", "C2"):
         ubicacion = _obtener_valor_mapa(tabla_ubicaciones, insumo, {})
         descuento = ubicacion.get("descuento") if isinstance(ubicacion, dict) else ""
         if descuento == "LINEA":
-            return salida_registrada
+            return salida_total
 
-        return max(ventas_neola, salida_registrada)
+        return ventas_neola + cantidad_especial
 
     return ventas_neola
 
@@ -1182,7 +1434,7 @@ def _ingresos_transferidos_a_linea(registros: dict, tabla_ubicaciones: dict) -> 
             ubicacion = _obtener_valor_mapa(tabla_ubicaciones, insumo, {})
             if ubicacion.get("descuento") != "LINEA":
                 continue
-            salida = mov.get("salida", 0)
+            salida = _salida_operativa_registro(mov)
             if salida:
                 transferidos[insumo] = transferidos.get(insumo, 0) + salida
     return transferidos
@@ -1200,6 +1452,7 @@ def _valores_inventario_para_insumo(
     modo_ventas: str = "final_ticket",
 ) -> list:
     ingreso = registro.get("ingreso", 0)
+    cantidad_especial = _cantidad_motivo_registro(registro)
     if ubicacion_key == "LINEA":
         ingreso += ingresos_linea_transferidos.get(insumo, 0)
 
@@ -1215,17 +1468,24 @@ def _valores_inventario_para_insumo(
     if ubicacion_key == "LINEA" and registro.get("conteo") is not None:
         cierre = registro["conteo"]
         salida = cierre_previo + ingreso - cierre
-        dif = salida - ventas
+        if cantidad_especial > salida:
+            raise ValueError(
+                f"'{insumo}' en LINEA CALIENTE tiene cantidad especial ({cantidad_especial}) mayor que salida ({salida})."
+            )
+        salida_operativa = max(salida - cantidad_especial, 0)
+        dif = salida_operativa - ventas
     else:
         salida_real = registro.get("salida", 0)
         if ubicacion_key == "LINEA":
-            cierre = cierre_previo + ingreso - salida_real - ventas
-            salida = salida_real
-            dif = 0
+            ventas += cantidad_especial
+            salida_no_ventas = max(salida_real - cantidad_especial, 0)
+            cierre = cierre_previo + ingreso - ventas - salida_no_ventas
+            salida = ventas + salida_no_ventas
+            dif = salida - ventas
         else:
             cierre = cierre_previo + ingreso - salida_real
             salida = salida_real
-            dif = salida - ventas
+            dif = salida_real - ventas
 
     return [
         cierre_previo if cierre_previo != "" else "",
@@ -1241,25 +1501,23 @@ def _referencia_celda(row: int, col: int) -> str:
     return gspread.utils.rowcol_to_a1(row, col)
 
 
-def _formula_salida_inventario(ubicacion_key: str, row: int, col_destino: int, conteo_presente: bool) -> str:
+def _formula_salida_inventario(ubicacion_key: str, row: int, col_destino: int,
+                               conteo_presente: bool, cantidad_especial: int) -> str:
     inicio_ref = _referencia_celda(row, col_destino)
     ingreso_ref = _referencia_celda(row, col_destino + 1)
-    ventas_ref = _referencia_celda(row, col_destino + 4)
     cierre_ref = _referencia_celda(row, col_destino + 5)
-
-    if ubicacion_key == "LINEA" and not conteo_presente:
-        return f"={inicio_ref}+{ingreso_ref}-{cierre_ref}-{ventas_ref}"
 
     return f"={inicio_ref}+{ingreso_ref}-{cierre_ref}"
 
 
-def _formula_dif_inventario(ubicacion_key: str, row: int, col_destino: int, conteo_presente: bool) -> str:
-    if ubicacion_key == "LINEA" and not conteo_presente:
-        return "=0"
-
+def _formula_dif_inventario(ubicacion_key: str, row: int, col_destino: int,
+                            conteo_presente: bool, cantidad_especial: int) -> str:
     salida_ref = _referencia_celda(row, col_destino + 2)
     ventas_ref = _referencia_celda(row, col_destino + 4)
-    return f"={salida_ref}-{ventas_ref}"
+    formula = f"={salida_ref}-{ventas_ref}"
+    if ubicacion_key == "LINEA" and conteo_presente and cantidad_especial > 0:
+        formula += f"-{cantidad_especial}"
+    return formula
 
 
 def _fila_inventario_para_insumo(
@@ -1288,12 +1546,13 @@ def _fila_inventario_para_insumo(
         modo_ventas,
     )
     conteo_presente = ubicacion_key == "LINEA" and registro.get("conteo") is not None
+    cantidad_especial = _cantidad_motivo_registro(registro)
 
     return [
         valores[0],
         valores[1],
-        _formula_salida_inventario(ubicacion_key, row, col_destino, conteo_presente),
-        _formula_dif_inventario(ubicacion_key, row, col_destino, conteo_presente),
+        _formula_salida_inventario(ubicacion_key, row, col_destino, conteo_presente, cantidad_especial),
+        _formula_dif_inventario(ubicacion_key, row, col_destino, conteo_presente, cantidad_especial),
         valores[4],
         valores[5],
     ]
@@ -1303,6 +1562,56 @@ def _batch_update_user_entered(ws, data: list[dict]):
     _ejecutar_con_retry_sheets(
         lambda: ws.batch_update(data, raw=False),
         operacion=f"escribir batch en {_nombre_ws(ws)}",
+    )
+    _esperar_despues_de_write()
+
+
+def _nota_motivos_especiales(motivos: list[dict]) -> str:
+    lineas = []
+    for item in motivos or []:
+        observacion = str(item.get("observacion", "") or "").strip()
+        if not observacion:
+            continue
+        motivo = str(item.get("motivo", "") or "").strip()
+        cantidad = int(item.get("cantidad", 0) or 0)
+        prefijo = motivo
+        if prefijo and cantidad:
+            prefijo = f"{prefijo} ({cantidad})"
+        lineas.append(f"{prefijo}: {observacion}" if prefijo else observacion)
+    return "\n".join(lineas)
+
+
+def _requests_notas_movimientos_especiales(ws, row: int, col_destino: int, registro: dict) -> list[dict]:
+    ingreso_note = _nota_motivos_especiales(_motivos_ingreso_registro(registro))
+    salida_note = _nota_motivos_especiales(_motivos_salida_registro(registro))
+
+    requests = []
+    for col, note in (
+        (col_destino + 1, ingreso_note),
+        (col_destino + 2, salida_note),
+    ):
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": row - 1,
+                    "endRowIndex": row,
+                    "startColumnIndex": col - 1,
+                    "endColumnIndex": col,
+                },
+                "cell": {"note": note},
+                "fields": "note",
+            }
+        })
+    return requests
+
+
+def _batch_update_notas(ws, requests: list[dict]):
+    if not requests:
+        return
+    _ejecutar_con_retry_sheets(
+        lambda: ws.spreadsheet.batch_update({"requests": requests}),
+        operacion=f"escribir notas en {_nombre_ws(ws)}",
     )
     _esperar_despues_de_write()
 
@@ -1371,6 +1680,7 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
             operacion=f"leer cierres previos en {_nombre_ws(ws)}",
         )
         rango_bloque = []
+        note_requests = []
 
         for fila in range(fila_datos, fila_fin + 1):
             insumo = productos[fila - 1].strip() if fila - 1 < len(productos) else ""
@@ -1395,6 +1705,7 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
                     modo_ventas=modo_ventas,
                 )
             )
+            note_requests.extend(_requests_notas_movimientos_especiales(ws, fila, col_destino, registro))
 
         _ejecutar_con_retry_sheets(
             lambda: ws.batch_update([
@@ -1418,6 +1729,7 @@ def escribir_inventario_dia(fecha: str, consumo_agrupado: dict, registros: dict,
                 "values": rango_bloque,
             },
         ])
+        _batch_update_notas(ws, note_requests)
         _cache_invalidate(cache, ("inventario",))
 
 
@@ -1451,6 +1763,7 @@ def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado
         )
 
         updates = []
+        note_requests = []
         for fila in range(fila_datos, fila_fin + 1):
             insumo = productos[fila - 1].strip() if fila - 1 < len(productos) else ""
             if not _resolver_clave_mapa(objetivos, insumo):
@@ -1478,10 +1791,12 @@ def corregir_inventario_insumos(fecha: str, insumos: list[str], consumo_agrupado
                 ),
                 "values": [values],
             })
+            note_requests.extend(_requests_notas_movimientos_especiales(ws, fila, col_destino, registro))
             actualizados[hoja_nombre].append(insumo)
 
         if updates:
             _batch_update_user_entered(ws, updates)
+            _batch_update_notas(ws, note_requests)
             _cache_invalidate(cache, ("inventario",))
 
     return actualizados
