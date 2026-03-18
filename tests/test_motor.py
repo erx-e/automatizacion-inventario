@@ -31,15 +31,39 @@ def cargar_motor():
         "recetas": [],
         "consumo": [],
         "alertas": [],
+        "diagnostico_parser": {
+            "problema": "",
+            "platos_dudosos": [],
+            "requiere_aclaracion": False,
+            "mensajes": [],
+        },
         "ubicaciones": {},
         "registros": {"C1": {}, "C2": {}, "LINEA": {}},
         "ventas_writes": [],
         "inventario_writes": [],
         "inventario_corrections": [],
+        "registro_updates": [],
+        "calls": {
+            "leer_recetas": 0,
+            "leer_ubicacion_descuento": 0,
+            "leer_registros_dia_completo": 0,
+            "leer_ventas_neola_dia": 0,
+            "verificar_inventario_dia_existe": 0,
+        },
     }
+
+    def contar(nombre, valor):
+        state["calls"][nombre] += 1
+        return valor
 
     parser_module.parsear_foto_ticket = lambda image_path: state["ventas"]
     parser_module.parsear_foto_bytes = lambda image_bytes, media_type="image/jpeg": state["ventas"]
+    parser_module.obtener_diagnostico_lectura = lambda: {
+        "problema": state["diagnostico_parser"]["problema"],
+        "platos_dudosos": list(state["diagnostico_parser"]["platos_dudosos"]),
+        "requiere_aclaracion": bool(state["diagnostico_parser"]["requiere_aclaracion"]),
+        "mensajes": list(state["diagnostico_parser"]["mensajes"]),
+    }
     sys.modules["parser_neola"] = parser_module
 
     recetas_module = types.ModuleType("recetas")
@@ -55,7 +79,11 @@ def cargar_motor():
 
     def buscar_receta_stub(plato_neola, recetas):
         plato_norm = normalizar(plato_neola)
-        exactos = [r for r in recetas if normalizar(r["plato"]) == plato_norm]
+        exactos = []
+        for receta in recetas:
+            candidatos = [receta["plato"], *(receta.get("nombres_neola") or [])]
+            if plato_norm in {normalizar(nombre) for nombre in candidatos if nombre}:
+                exactos.append(receta)
         return exactos
 
     recetas_module.buscar_receta = buscar_receta_stub
@@ -89,18 +117,18 @@ def cargar_motor():
     sys.modules["recetas"] = recetas_module
 
     sheets_module = types.ModuleType("sheets_connector")
-    sheets_module.leer_recetas = lambda: state["recetas"]
-    sheets_module.leer_ubicacion_descuento = lambda: state["ubicaciones"]
-    sheets_module.leer_registros_dia_completo = lambda fecha: state["registros"]
-    sheets_module.escribir_ventas_neola = lambda fecha, ventas, consumo: state["ventas_writes"].append(
+    sheets_module.leer_recetas = lambda cache=None: contar("leer_recetas", state["recetas"])
+    sheets_module.leer_ubicacion_descuento = lambda cache=None: contar("leer_ubicacion_descuento", state["ubicaciones"])
+    sheets_module.leer_registros_dia_completo = lambda fecha, cache=None: contar("leer_registros_dia_completo", state["registros"])
+    sheets_module.escribir_ventas_neola = lambda fecha, ventas, consumo, cache=None: state["ventas_writes"].append(
         (fecha, ventas, consumo)
     )
     sheets_module.escribir_inventario_dia = (
-        lambda fecha, consumo_agrupado, registros, ubicaciones, modo_ventas="final_ticket": state["inventario_writes"].append(
+        lambda fecha, consumo_agrupado, registros, ubicaciones, modo_ventas="final_ticket", cache=None: state["inventario_writes"].append(
             (fecha, consumo_agrupado, registros, ubicaciones, modo_ventas)
         )
     )
-    sheets_module.corregir_inventario_insumos = lambda fecha, insumos, consumo_agrupado, registros, ubicaciones, modo_ventas="final_ticket": (
+    sheets_module.corregir_inventario_insumos = lambda fecha, insumos, consumo_agrupado, registros, ubicaciones, modo_ventas="final_ticket", cache=None: (
         state["inventario_corrections"].append(
             (fecha, insumos, consumo_agrupado, registros, ubicaciones, modo_ventas)
         ) or {
@@ -109,17 +137,21 @@ def cargar_motor():
             "LINEA CALIENTE": [],
         }
     )
-    sheets_module.leer_diferencias_inventario_dia = lambda fecha: {
+    sheets_module.actualizar_registros_dia = lambda fecha, ajustes, cache=None: (
+        state["registro_updates"].append((fecha, ajustes)) or {"C1": [], "C2": [], "LINEA": []}
+    )
+    sheets_module.leer_diferencias_inventario_dia = lambda fecha, cache=None: {
         "C1": [],
         "C2": [],
         "LINEA CALIENTE": [],
     }
-    sheets_module.verificar_inventario_dia_existe = lambda fecha: {
+    sheets_module.verificar_inventario_dia_existe = lambda fecha, cache=None: {
+        **contar("verificar_inventario_dia_existe", {}),
         "C1": True,
         "C2": True,
         "LINEA CALIENTE": True,
     }
-    sheets_module.leer_ventas_neola_dia = lambda fecha: state["ventas_excel"]
+    sheets_module.leer_ventas_neola_dia = lambda fecha, cache=None: contar("leer_ventas_neola_dia", state["ventas_excel"])
     sys.modules["sheets_connector"] = sheets_module
 
     motor = importlib.import_module("motor")
@@ -213,7 +245,7 @@ class ConfirmarCierreTests(unittest.TestCase):
                 "ubicacion": "C1",
             }
         ], [])
-        motor.leer_diferencias_inventario_dia = lambda fecha: (_ for _ in ()).throw(
+        motor.leer_diferencias_inventario_dia = lambda fecha, cache=None: (_ for _ in ()).throw(
             ValueError("sin lectura final")
         )
 
@@ -228,7 +260,7 @@ class ConfirmarCierreTests(unittest.TestCase):
         motor, state = cargar_motor()
         state["ubicaciones"] = {}
         state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
-        motor.escribir_ventas_neola = lambda fecha, ventas, consumo: (_ for _ in ()).throw(
+        motor.escribir_ventas_neola = lambda fecha, ventas, consumo, cache=None: (_ for _ in ()).throw(
             ValueError("No se pudo corregir automaticamente VENTAS NEOLA")
         )
 
@@ -249,11 +281,36 @@ class ConfirmarCierreTests(unittest.TestCase):
         self.assertIn("Inventario no actualizado porque no se pudo corregir automaticamente VENTAS NEOLA", reporte)
         self.assertEqual(state["inventario_writes"], [])
 
+    def test_muestra_mensaje_amable_si_guardar_ventas_da_rate_limit(self):
+        motor, state = cargar_motor()
+        state["ubicaciones"] = {}
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+        motor.escribir_ventas_neola = lambda fecha, ventas, consumo, cache=None: (_ for _ in ()).throw(
+            Exception("APIError: [429]: Quota exceeded for quota metric 'Write requests'")
+        )
+
+        preparacion = {
+            "fecha": "2026-03-13",
+            "ventas": [{"plato": "HAMBURGUESA GOLD", "cantidad": 1, "precio_total": 9.99}],
+            "ventas_originales": [{"plato": "HAMBURGUESA GOLD", "cantidad": 1, "precio_total": 9.99}],
+            "consumo": [],
+            "consumo_agrupado": {},
+            "alertas": [],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            motor.CIERRES_DIR = Path(tmp_dir) / "cierres"
+            reporte = motor.confirmar_cierre(preparacion)
+
+        self.assertIn("muchas solicitudes", reporte)
+        self.assertIn("tiempo de espera puede aumentar", reporte)
+        self.assertNotIn("APIError", reporte)
+
     def test_reporte_final_agrupa_diferencias_por_hoja(self):
         motor, state = cargar_motor()
         state["ubicaciones"] = {}
         state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
-        motor.leer_diferencias_inventario_dia = lambda fecha: {
+        motor.leer_diferencias_inventario_dia = lambda fecha, cache=None: {
             "C1": [{"insumo": "POLLO", "inicio": 0, "ingreso": 2, "salida": 1, "dif": -1, "ventas": 2, "cierre": 1}],
             "C2": [],
             "LINEA CALIENTE": [{"insumo": "CERDO", "inicio": 3, "ingreso": 10, "salida": 7, "dif": 0, "ventas": 7, "cierre": 6}],
@@ -276,6 +333,34 @@ class ConfirmarCierreTests(unittest.TestCase):
         self.assertIn("C1:", reporte)
         self.assertIn("C2:", reporte)
         self.assertIn("LINEA CALIENTE:", reporte)
+
+    def test_confirmar_cierre_emite_hitos_de_progreso(self):
+        motor, state = cargar_motor()
+        state["ubicaciones"] = {}
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+        preparacion = {
+            "fecha": "2026-03-13",
+            "ventas": [{"plato": "X", "cantidad": 1, "precio_total": 1}],
+            "ventas_originales": [{"plato": "X", "cantidad": 1, "precio_total": 1}],
+            "consumo": [],
+            "consumo_agrupado": {},
+            "alertas": [],
+        }
+
+        progreso = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            motor.CIERRES_DIR = Path(tmp_dir) / "cierres"
+            motor.confirmar_cierre(preparacion, on_progress=progreso.append)
+
+        self.assertEqual(
+            progreso,
+            [
+                "Estoy revisando los datos del día.",
+                "Estoy guardando las ventas del día.",
+                "Estoy actualizando el inventario.",
+                "Estoy revisando si quedó alguna diferencia.",
+            ],
+        )
 
     def test_formato_diferencias_explica_cuando_neola_vende_mas_que_la_salida(self):
         motor, _ = cargar_motor()
@@ -429,7 +514,7 @@ class RollitosRellenosTests(unittest.TestCase):
         state["ventas"] = [
             {"plato": "ROLLITOS RELLENO", "cantidad": 2, "precio_total": 10.00},
         ]
-        motor.leer_registros_dia_completo = lambda fecha: (_ for _ in ()).throw(
+        motor.leer_registros_dia_completo = lambda fecha, cache=None: (_ for _ in ()).throw(
             AssertionError("solo_consumo_teorico no debe consultar registros")
         )
 
@@ -493,6 +578,68 @@ class RollitosRellenosTests(unittest.TestCase):
 
 
 class FormatoPreviewTests(unittest.TestCase):
+    def test_preparar_cierre_agrupa_aliases_neola_bajo_nombre_canonico(self):
+        motor, state = cargar_motor()
+        state["ventas"] = [
+            {"plato": "SANDWICH DE PEPE", "cantidad": 1, "precio_total": 0.0},
+            {"plato": "SANDWICH DE PEPP", "cantidad": 1, "precio_total": 7.99},
+        ]
+        state["recetas"] = [
+            {
+                "plato": "SANDWICH DE PEPE",
+                "nombre_menu": "SANDWICH DE PEPERONI",
+                "nombres_neola": ["SANDWICH DE PEPE", "SANDWICH DE PEPP"],
+                "sku": "EMB-001",
+                "insumo": "PEPERONI SANDUCHE 80 gr 8 unid",
+                "cantidad": 1,
+                "unidad": "PAX",
+                "ubicacion": "C1",
+            },
+            {
+                "plato": "SANDWICH DE PEPE",
+                "nombre_menu": "SANDWICH DE PEPERONI",
+                "nombres_neola": ["SANDWICH DE PEPE", "SANDWICH DE PEPP"],
+                "sku": "PAN-010",
+                "insumo": "PANINI (SANDUCHE- JAMON, PEPERONI)",
+                "cantidad": 1,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+        state["consumo"] = [
+            {
+                "plato": "SANDWICH DE PEPE",
+                "cantidad_platos": 2,
+                "insumo": "PEPERONI SANDUCHE 80 gr 8 unid",
+                "sku": "EMB-001",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 2,
+                "unidad": "PAX",
+                "ubicacion": "C1",
+            },
+            {
+                "plato": "SANDWICH DE PEPE",
+                "cantidad_platos": 2,
+                "insumo": "PANINI (SANDUCHE- JAMON, PEPERONI)",
+                "sku": "PAN-010",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 2,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+
+        preparacion = motor.preparar_cierre(image_path="ticket.jpg", fecha="2026-03-10")
+
+        self.assertTrue(preparacion["ok"])
+        self.assertEqual(
+            preparacion["ventas"],
+            [{"plato": "SANDWICH DE PEPE", "cantidad": 2, "precio_total": 7.99}],
+        )
+        self.assertIn("SANDWICH DE PEPE x2", preparacion["resumen"])
+        self.assertNotIn("SANDWICH DE PEPP x", preparacion["resumen"])
+        self.assertIn("PANINI (SANDUCHE- JAMON, PEPERONI): 2 UND", preparacion["resumen"])
+
     def test_preparar_cierre_muestra_insumos_indentados_y_total_simple(self):
         motor, state = cargar_motor()
         state["ventas"] = [
@@ -543,6 +690,7 @@ class FormatoPreviewTests(unittest.TestCase):
         self.assertIn("      - Motivo: Receta sin insumos inventariables", preparacion["resumen"])
         self.assertIn("📦 Total por insumo (2 insumos):", preparacion["resumen"])
         self.assertNotIn("📍 C1", preparacion["resumen"])
+        self.assertIn("por favor no edites manualmente las hojas", preparacion["resumen"])
 
     def test_preparar_cierre_aclara_ensalada_caesar_por_defecto(self):
         motor, state = cargar_motor()
@@ -585,21 +733,52 @@ class FormatoPreviewTests(unittest.TestCase):
         self.assertTrue(preparacion["precierre"])
         self.assertIn("Ticket marcado como precierre", preparacion["resumen"])
 
+    def test_preparar_cierre_muestra_alerta_si_la_imagen_es_poco_legible(self):
+        motor, state = cargar_motor()
+        state["ventas"] = [
+            {"plato": "HAMBURGUESA GOLD", "cantidad": 1, "precio_total": 9.99},
+        ]
+        state["diagnostico_parser"] = {
+            "problema": "La foto está borrosa en una parte.",
+            "platos_dudosos": ["SANDWICH DE PEPE"],
+            "requiere_aclaracion": True,
+            "mensajes": ["La foto está borrosa en una parte."],
+        }
+
+        preparacion = motor.preparar_cierre(image_path="ticket.jpg", fecha="2026-03-10")
+
+        self.assertTrue(preparacion["ok"])
+        self.assertIn("⚠️ Alertas:", preparacion["resumen"])
+        self.assertIn("La foto no se ve del todo clara", preparacion["resumen"])
+        self.assertIn("💬 Si quieres afinar la lectura:", preparacion["resumen"])
+        self.assertIn("Si puedes, envíame una foto más clara", preparacion["resumen"])
+        self.assertIn("SANDWICH DE PEPE", preparacion["resumen"])
+        self.assertIn("Puedo seguir con el precierre", preparacion["resumen"])
+        self.assertIn("¿Todo correcto? ¿Procedo con el cierre?", preparacion["resumen"])
+        self.assertEqual(
+            preparacion["observaciones_lectura"],
+            [
+                "⚠️ La foto no se ve del todo clara en algunas partes.",
+                "⚠️ No pude leer con seguridad estos nombres: SANDWICH DE PEPE.",
+            ],
+        )
+
     def test_preparar_cierre_bloquea_receta_similar_por_confirmar(self):
         motor, state = cargar_motor()
         state["ventas"] = [
             {"plato": "TABLA DE QUESOS", "cantidad": 1, "precio_total": 14.99},
         ]
         state["alertas"] = [
-            "❓ Posible receta similar: en recetas existe 'TABLA QUESOS EMB', pero en el ticket sale 'TABLA DE QUESOS'. ¿Cambio el nombre de la receta a 'TABLA DE QUESOS' y aplico esa receta?"
+            "❓ No encontré una receta exacta para 'TABLA DE QUESOS'. La más parecida es 'TABLA QUESOS EMB'. ¿Es ese mismo plato? Si sí, lo tomo con esa receta. Si no, dime si es otro nombre del mismo plato o si corresponde a una receta distinta."
         ]
 
         preparacion = motor.preparar_cierre(image_path="ticket.jpg", fecha="2026-03-10")
 
         self.assertFalse(preparacion["ok"])
         self.assertTrue(preparacion["requiere_aclaracion"])
-        self.assertIn("no coincide exactamente con las recetas", preparacion["resumen"])
+        self.assertIn("no pude relacionar con seguridad con una receta", preparacion["resumen"])
         self.assertIn("TABLA QUESOS EMB", preparacion["resumen"])
+        self.assertIn("si es ese mismo plato", preparacion["resumen"])
 
     def test_solo_consumo_teorico_usa_el_mismo_formato_para_mensajeria(self):
         motor, state = cargar_motor()
@@ -625,6 +804,25 @@ class FormatoPreviewTests(unittest.TestCase):
         self.assertIn("   • SALCHIPRAGA x4", salida)
         self.assertIn("      - SALCHICHA VIENESA H-D: 8 UNID", salida)
         self.assertIn("📦 Total por insumo (1 insumo):", salida)
+
+    def test_solo_parsear_ticket_notifica_observaciones_de_lectura(self):
+        motor, state = cargar_motor()
+        state["ventas"] = [
+            {"plato": "PIZZA", "cantidad": 1, "precio_total": 12.50},
+        ]
+        state["diagnostico_parser"] = {
+            "problema": "El nombre de un plato se ve borroso.",
+            "platos_dudosos": ["PIZZA ESPECIAL"],
+            "requiere_aclaracion": True,
+            "mensajes": ["El nombre de un plato se ve borroso."],
+        }
+
+        salida = motor.solo_parsear_ticket(image_path="ticket.jpg")
+
+        self.assertIn("La foto no se ve del todo clara", salida)
+        self.assertIn("Si puedes, envíame una foto más clara", salida)
+        self.assertIn("PIZZA ESPECIAL", salida)
+        self.assertIn("PIZZA x1", salida)
 
 
 class HistorialCierreTests(unittest.TestCase):
@@ -702,6 +900,7 @@ class InventarioRegistrosTests(unittest.TestCase):
         self.assertIn("salida=2", prep["resumen"])
         self.assertIn("CREPE POLLO 2 unid", prep["resumen"])
         self.assertIn("¿Todo correcto?", prep["resumen"])
+        self.assertIn("por favor no edites manualmente las hojas", prep["resumen"])
 
     def test_preparar_inventario_registros_falla_sin_registros(self):
         motor, state = cargar_motor()
@@ -731,6 +930,7 @@ class InventarioRegistrosTests(unittest.TestCase):
         self.assertIn("INVENTARIO CREADO", resultado)
         self.assertIn("2026-03-14", resultado)
         self.assertIn("VENTAS provisional", resultado)
+        self.assertIn("Si hiciste algún cambio manual en las hojas", resultado)
         self.assertEqual(len(state["inventario_writes"]), 1)
         fecha, consumo, registros, ubicaciones, modo_ventas = state["inventario_writes"][0]
         self.assertEqual(fecha, "2026-03-14")
@@ -756,7 +956,7 @@ class InventarioRegistrosTests(unittest.TestCase):
 class SoloVentasTests(unittest.TestCase):
     def test_preparar_solo_ventas_falla_si_entrada_no_existe(self):
         motor, state = cargar_motor()
-        motor.verificar_inventario_dia_existe = lambda fecha: {
+        motor.verificar_inventario_dia_existe = lambda fecha, cache=None: {
             "C1": True,
             "C2": False,
             "LINEA CALIENTE": True,
@@ -801,7 +1001,7 @@ class SoloVentasTests(unittest.TestCase):
 
     def test_preparar_solo_ventas_falla_si_todas_las_hojas_faltan(self):
         motor, state = cargar_motor()
-        motor.verificar_inventario_dia_existe = lambda fecha: {
+        motor.verificar_inventario_dia_existe = lambda fecha, cache=None: {
             "C1": False,
             "C2": False,
             "LINEA CALIENTE": False,
@@ -862,6 +1062,7 @@ class SoloVentasTests(unittest.TestCase):
             resultado = motor.confirmar_solo_ventas(preparacion)
 
         self.assertIsInstance(resultado, str)
+        self.assertIn("Si hiciste algún cambio manual en las hojas", resultado)
         self.assertEqual(len(state["ventas_writes"]), 1)
         self.assertEqual(len(state["inventario_corrections"]), 1)
 
@@ -925,16 +1126,293 @@ class ActualizacionTicketTests(unittest.TestCase):
             "cambios": [{"plato": "NACHOS", "cantidad_actual": 2, "cantidad_nueva": 3, "delta": 1}],
             "insumos_afectados": ["INS-NACHOS"],
             "origen_actualizacion": "ticket_nuevo",
+            "recalcular_inventario_completo": False,
+        }
+
+        resultado = motor.confirmar_actualizacion_ticket(preparacion)
+
+        self.assertIn("ACTUALIZACIÓN APLICADA", resultado)
+        self.assertIn("Si hiciste algún cambio manual en las hojas", resultado)
+        self.assertEqual(len(state["ventas_writes"]), 1)
+        self.assertEqual(len(state["inventario_corrections"]), 1)
+
+    def test_confirmar_actualizacion_ticket_reescribe_todo_el_inventario_si_viene_de_precierre(self):
+        motor, state = cargar_motor()
+        preparacion = {
+            "fecha": "2026-03-14",
+            "ventas_finales": [{"plato": "NACHOS", "cantidad": 3, "precio_total": 18.0}],
+            "consumo_final": [{
+                "plato": "NACHOS",
+                "cantidad_platos": 3,
+                "insumo": "INS-NACHOS",
+                "sku": "SKU",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 3,
+                "unidad": "UND",
+                "ubicacion": "C1",
+            }],
+            "consumo_agrupado_final": {
+                "INS-NACHOS": {"total": 3, "unidad": "UND", "ubicacion": "C1", "sku": "SKU", "detalle": []},
+            },
+            "registros": {"C1": {}, "C2": {}, "LINEA": {}},
+            "ubicaciones": {},
+            "cambios": [{"plato": "NACHOS", "cantidad_actual": 2, "cantidad_nueva": 3, "delta": 1}],
+            "insumos_afectados": ["INS-NACHOS"],
+            "origen_actualizacion": "ticket_nuevo",
+            "recalcular_inventario_completo": True,
         }
 
         resultado = motor.confirmar_actualizacion_ticket(preparacion)
 
         self.assertIn("ACTUALIZACIÓN APLICADA", resultado)
         self.assertEqual(len(state["ventas_writes"]), 1)
-        self.assertEqual(len(state["inventario_corrections"]), 1)
+        self.assertEqual(len(state["inventario_writes"]), 1)
+        self.assertEqual(len(state["inventario_corrections"]), 0)
+
+    def test_confirmar_actualizacion_ticket_emite_hitos_de_progreso(self):
+        motor, state = cargar_motor()
+        preparacion = {
+            "fecha": "2026-03-14",
+            "ventas_finales": [{"plato": "NACHOS", "cantidad": 3, "precio_total": 18.0}],
+            "consumo_final": [{
+                "plato": "NACHOS",
+                "cantidad_platos": 3,
+                "insumo": "INS-NACHOS",
+                "sku": "SKU",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 3,
+                "unidad": "UND",
+                "ubicacion": "C1",
+            }],
+            "consumo_agrupado_final": {
+                "INS-NACHOS": {"total": 3, "unidad": "UND", "ubicacion": "C1", "sku": "SKU", "detalle": []},
+            },
+            "registros": {"C1": {}, "C2": {}, "LINEA": {}},
+            "ubicaciones": {},
+            "cambios": [{"plato": "NACHOS", "cantidad_actual": 2, "cantidad_nueva": 3, "delta": 1}],
+            "insumos_afectados": ["INS-NACHOS"],
+            "origen_actualizacion": "ticket_nuevo",
+        }
+
+        progreso = []
+        motor.confirmar_actualizacion_ticket(preparacion, on_progress=progreso.append)
+
+        self.assertEqual(
+            progreso,
+            [
+                "Estoy actualizando las ventas del día.",
+                "Estoy recalculando solo lo que cambió en inventario.",
+                "Estoy revisando si quedó alguna diferencia.",
+            ],
+        )
+
+    def test_preparar_actualizacion_ticket_muestra_mensaje_amable_si_hay_rate_limit(self):
+        motor, state = cargar_motor()
+        state["ventas"] = [
+            {"plato": "NACHOS", "cantidad": 3, "precio_total": 18.0},
+        ]
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+        motor.leer_ventas_neola_dia = lambda fecha, cache=None: (_ for _ in ()).throw(
+            Exception("APIError: [429]: Quota exceeded for quota metric 'Read requests'")
+        )
+
+        prep = motor.preparar_actualizacion_ticket(
+            image_path="ticket.jpg",
+            fecha="2026-03-14",
+        )
+
+        self.assertFalse(prep["ok"])
+        self.assertIn("muchas solicitudes", prep["resumen"])
+        self.assertIn("tiempo de espera puede aumentar", prep["resumen"])
+        self.assertNotIn("APIError", prep["resumen"])
+
+
+class ContextoMotorTests(unittest.TestCase):
+    def test_preparar_actualizacion_ticket_reutiliza_recetas_en_misma_ejecucion(self):
+        motor, state = cargar_motor()
+        state["ventas"] = [
+            {"plato": "NACHOS", "cantidad": 2, "precio_total": 18.0},
+        ]
+        state["ventas_excel"] = []
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+        state["consumo"] = [{
+            "plato": "NACHOS",
+            "cantidad_platos": 2,
+            "insumo": "INS-NACHOS",
+            "sku": "SKU",
+            "cantidad_por_plato": 1,
+            "cantidad_total": 2,
+            "unidad": "UND",
+            "ubicacion": "C1",
+        }]
+
+        prep = motor.preparar_actualizacion_ticket(
+            image_path="ticket.jpg",
+            fecha="2026-03-14",
+        )
+
+        self.assertTrue(prep["ok"])
+        self.assertEqual(state["calls"]["leer_recetas"], 1)
+        self.assertEqual(state["calls"]["leer_registros_dia_completo"], 1)
+        self.assertEqual(state["calls"]["leer_ventas_neola_dia"], 1)
+        self.assertEqual(state["calls"]["verificar_inventario_dia_existe"], 1)
+
+    def test_preparar_ajuste_ventas_reutiliza_ventas_actuales_en_misma_ejecucion(self):
+        motor, state = cargar_motor()
+        state["ventas_excel"] = [
+            {"plato": "NACHOS", "cantidad": 2, "precio_total": 0.0},
+        ]
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+        state["consumo"] = [{
+            "plato": "NACHOS",
+            "cantidad_platos": 3,
+            "insumo": "INS-NACHOS",
+            "sku": "SKU",
+            "cantidad_por_plato": 1,
+            "cantidad_total": 3,
+            "unidad": "UND",
+            "ubicacion": "C1",
+        }]
+
+        prep = motor.preparar_ajuste_ventas(
+            fecha="2026-03-14",
+            ajustes=[{"plato": "NACHOS", "delta": 1}],
+        )
+
+        self.assertTrue(prep["ok"])
+        self.assertEqual(state["calls"]["leer_recetas"], 1)
+        self.assertEqual(state["calls"]["leer_ventas_neola_dia"], 1)
+        self.assertEqual(state["calls"]["leer_registros_dia_completo"], 1)
+        self.assertEqual(state["calls"]["leer_ubicacion_descuento"], 1)
+        self.assertEqual(state["calls"]["verificar_inventario_dia_existe"], 1)
+
+    def test_ejecutar_cierre_reutiliza_recetas_entre_preparar_y_confirmar(self):
+        motor, state = cargar_motor()
+        state["ventas"] = [
+            {"plato": "HAMBURGUESA GOLD", "cantidad": 1, "precio_total": 9.99},
+        ]
+        state["consumo"] = [{
+            "plato": "HAMBURGUESA GOLD",
+            "cantidad_platos": 1,
+            "insumo": "PAN",
+            "sku": "SKU-1",
+            "cantidad_por_plato": 1,
+            "cantidad_total": 1,
+            "unidad": "UND",
+            "ubicacion": "C1",
+        }]
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+        state["ubicaciones"] = {"PAN": "C1"}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            motor.CIERRES_DIR = Path(tmp_dir) / "cierres"
+            reporte = motor.ejecutar_cierre(
+                image_bytes=b"jpg",
+                media_type="image/jpeg",
+                fecha="2026-03-14",
+            )
+
+        self.assertIn("CIERRE DE INVENTARIO", reporte)
+        self.assertEqual(state["calls"]["leer_recetas"], 1)
+        self.assertEqual(state["calls"]["leer_registros_dia_completo"], 1)
+        self.assertEqual(state["calls"]["leer_ubicacion_descuento"], 1)
 
 
 class AjusteVentasTests(unittest.TestCase):
+    def test_preparar_actualizacion_ticket_ignora_cambios_falsos_por_alias(self):
+        motor, state = cargar_motor()
+        state["ventas_excel"] = [
+            {"plato": "SANDWICH DE PEPE", "cantidad": 1, "precio_total": 0.0},
+            {"plato": "SANDWICH DE PEPP", "cantidad": 1, "precio_total": 7.99},
+        ]
+        state["ventas"] = [
+            {"plato": "SANDWICH DE PEPE", "cantidad": 2, "precio_total": 7.99},
+        ]
+        state["recetas"] = [
+            {
+                "plato": "SANDWICH DE PEPE",
+                "nombre_menu": "SANDWICH DE PEPERONI",
+                "nombres_neola": ["SANDWICH DE PEPE", "SANDWICH DE PEPP"],
+                "sku": "EMB-001",
+                "insumo": "PEPERONI SANDUCHE 80 gr 8 unid",
+                "cantidad": 1,
+                "unidad": "PAX",
+                "ubicacion": "C1",
+            },
+            {
+                "plato": "SANDWICH DE PEPE",
+                "nombre_menu": "SANDWICH DE PEPERONI",
+                "nombres_neola": ["SANDWICH DE PEPE", "SANDWICH DE PEPP"],
+                "sku": "PAN-010",
+                "insumo": "PANINI (SANDUCHE- JAMON, PEPERONI)",
+                "cantidad": 1,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+        state["consumo"] = [
+            {
+                "plato": "SANDWICH DE PEPE",
+                "cantidad_platos": 2,
+                "insumo": "PANINI (SANDUCHE- JAMON, PEPERONI)",
+                "sku": "PAN-010",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 2,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+
+        prep = motor.preparar_actualizacion_ticket(
+            image_path="ticket.jpg",
+            fecha="2026-03-14",
+        )
+
+        self.assertFalse(prep["ok"])
+        self.assertIn("no cambia las ventas", prep["resumen"])
+
+    def test_preparar_ajuste_ventas_canoniza_aliases_en_el_resumen(self):
+        motor, state = cargar_motor()
+        state["ventas_excel"] = [
+            {"plato": "SANDWICH DE PEPE", "cantidad": 1, "precio_total": 0.0},
+            {"plato": "SANDWICH DE PEPP", "cantidad": 1, "precio_total": 7.99},
+        ]
+        state["recetas"] = [
+            {
+                "plato": "SANDWICH DE PEPE",
+                "nombre_menu": "SANDWICH DE PEPERONI",
+                "nombres_neola": ["SANDWICH DE PEPE", "SANDWICH DE PEPP"],
+                "sku": "PAN-010",
+                "insumo": "PANINI (SANDUCHE- JAMON, PEPERONI)",
+                "cantidad": 1,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+        state["consumo"] = [
+            {
+                "plato": "SANDWICH DE PEPE",
+                "cantidad_platos": 3,
+                "insumo": "PANINI (SANDUCHE- JAMON, PEPERONI)",
+                "sku": "PAN-010",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 3,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+
+        prep = motor.preparar_ajuste_ventas(
+            fecha="2026-03-14",
+            ajustes=[{"plato": "SANDWICH DE PEPP", "delta": 1}],
+        )
+
+        self.assertTrue(prep["ok"])
+        self.assertIn("SANDWICH DE PEPE: 2 → 3 (+1)", prep["resumen"])
+        self.assertNotIn("SANDWICH DE PEPP: ", prep["resumen"])
+
     def test_preparar_ajuste_ventas_suma_y_resta(self):
         motor, state = cargar_motor()
         state["ventas_excel"] = [
@@ -983,6 +1461,231 @@ class AjusteVentasTests(unittest.TestCase):
         self.assertIn("cantidad negativa", prep["resumen"])
 
 
+class AjusteRegistrosTests(unittest.TestCase):
+    def test_preparar_ajuste_registros_muestra_before_after_y_recalculo(self):
+        motor, state = cargar_motor()
+        state["registros"] = {
+            "C1": {},
+            "C2": {},
+            "LINEA": {
+                "POLLO 160 gr CECAR": {"conteo": 3, "ingreso": 0, "salida": 0, "motivo": ""},
+            },
+        }
+        state["ventas_excel"] = [
+            {"plato": "ENSALADA CAESAR", "cantidad": 2, "precio_total": 17.99},
+        ]
+        state["consumo"] = [
+            {
+                "plato": "ENSALADA CAESAR",
+                "cantidad_platos": 2,
+                "insumo": "POLLO 160 gr CECAR",
+                "sku": "SKU",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 2,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+
+        prep = motor.preparar_ajuste_registros(
+            fecha="2026-03-14",
+            ajustes=[{
+                "ubicacion": "LINEA CALIENTE",
+                "insumo": "POLLO 160 gr CECAR",
+                "cambios": {"conteo": 2, "motivo": "correccion de cocina"},
+            }],
+        )
+
+        self.assertTrue(prep["ok"])
+        self.assertIn("LINEA CALIENTE / POLLO 160 gr CECAR", prep["resumen"])
+        self.assertIn("conteo: 3 → 2", prep["resumen"])
+        self.assertIn("motivo: vacío → correccion de cocina", prep["resumen"])
+        self.assertIn("resincronizará el inventario usando las ventas ya cargadas", prep["resumen"])
+
+    def test_preparar_ajuste_registros_bloquea_conteo_en_c1(self):
+        motor, state = cargar_motor()
+        state["registros"] = {"C1": {}, "C2": {}, "LINEA": {}}
+
+        prep = motor.preparar_ajuste_registros(
+            fecha="2026-03-14",
+            ajustes=[{
+                "ubicacion": "C1",
+                "insumo": "FILETE DE POLLO 200 gr",
+                "cambios": {"conteo": 3},
+            }],
+        )
+
+        self.assertFalse(prep["ok"])
+        self.assertIn("no usa conteo", prep["resumen"])
+
+    def test_confirmar_ajuste_registros_actualiza_registro_y_reescribe_inventario_final(self):
+        motor, state = cargar_motor()
+        state["ventas_excel"] = [
+            {"plato": "ENSALADA CAESAR", "cantidad": 2, "precio_total": 17.99},
+        ]
+        state["registros"] = {
+            "C1": {},
+            "C2": {},
+            "LINEA": {
+                "POLLO 160 gr CECAR": {"conteo": 3, "ingreso": 0, "salida": 0, "motivo": ""},
+            },
+        }
+        state["consumo"] = [
+            {
+                "plato": "ENSALADA CAESAR",
+                "cantidad_platos": 2,
+                "insumo": "POLLO 160 gr CECAR",
+                "sku": "SKU",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 2,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+        preparacion = {
+            "fecha": "2026-03-14",
+            "ajustes": [{
+                "ubicacion": "LINEA",
+                "insumo": "POLLO 160 gr CECAR",
+                "cambios": {"conteo": 2},
+            }],
+        }
+
+        resultado = motor.confirmar_ajuste_registros(preparacion)
+
+        self.assertIn("REGISTROS ACTUALIZADOS", resultado)
+        self.assertEqual(len(state["registro_updates"]), 1)
+        self.assertEqual(len(state["inventario_writes"]), 1)
+        self.assertEqual(state["inventario_writes"][0][4], "final_ticket")
+
+    def test_confirmar_ajuste_registros_recalcula_provisional_si_aun_no_hay_ventas(self):
+        motor, state = cargar_motor()
+        state["ventas_excel"] = []
+        state["registros"] = {
+            "C1": {"FILETE DE POLLO 200 gr": {"conteo": None, "ingreso": 0, "salida": 4, "motivo": ""}},
+            "C2": {},
+            "LINEA": {},
+        }
+        preparacion = {
+            "fecha": "2026-03-14",
+            "ajustes": [{
+                "ubicacion": "C1",
+                "insumo": "FILETE DE POLLO 200 gr",
+                "cambios": {"salida": 3},
+            }],
+        }
+
+        resultado = motor.confirmar_ajuste_registros(preparacion)
+
+        self.assertIn("Inventario recalculado solo desde registros", resultado)
+        self.assertEqual(len(state["inventario_writes"]), 1)
+        self.assertEqual(state["inventario_writes"][0][4], "provisional_registros")
+
+
+class RegistroCorregidoTests(unittest.TestCase):
+    def test_preparar_registro_corregido_confirma_valor_existente_en_hoja(self):
+        motor, state = cargar_motor()
+        state["registros"] = {
+            "C1": {},
+            "C2": {},
+            "LINEA": {
+                "POLLO 160 gr CECAR": {"conteo": 2, "ingreso": 0, "salida": 0, "motivo": ""},
+            },
+        }
+        state["ventas_excel"] = [
+            {"plato": "ENSALADA CAESAR", "cantidad": 2, "precio_total": 17.99},
+        ]
+        state["consumo"] = [
+            {
+                "plato": "ENSALADA CAESAR",
+                "cantidad_platos": 2,
+                "insumo": "POLLO 160 gr CECAR",
+                "sku": "SKU",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 2,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+
+        prep = motor.preparar_registro_corregido(
+            fecha="2026-03-14",
+            avisos=[{
+                "ubicacion": "LINEA CALIENTE",
+                "insumo": "POLLO 160 gr CECAR",
+                "cambios": {"conteo": 2},
+            }],
+        )
+
+        self.assertTrue(prep["ok"])
+        self.assertIn("Correcciones confirmadas en la hoja", prep["resumen"])
+        self.assertIn("conteo: 2", prep["resumen"])
+        self.assertIn("resincronizará el inventario usando las ventas ya cargadas", prep["resumen"])
+
+    def test_preparar_registro_corregido_falla_si_la_hoja_no_refleja_el_aviso(self):
+        motor, state = cargar_motor()
+        state["registros"] = {
+            "C1": {},
+            "C2": {},
+            "LINEA": {
+                "POLLO 160 gr CECAR": {"conteo": 3, "ingreso": 0, "salida": 0, "motivo": ""},
+            },
+        }
+
+        prep = motor.preparar_registro_corregido(
+            fecha="2026-03-14",
+            avisos=[{
+                "ubicacion": "LINEA",
+                "insumo": "POLLO 160 gr CECAR",
+                "cambios": {"conteo": 2},
+            }],
+        )
+
+        self.assertFalse(prep["ok"])
+        self.assertIn("Todavía no veo esa corrección en la hoja", prep["resumen"])
+        self.assertIn("en la hoja veo 3 y me indicaste 2", prep["resumen"])
+
+    def test_confirmar_registro_corregido_relee_y_recalcula_sin_escribir_registro(self):
+        motor, state = cargar_motor()
+        state["ventas_excel"] = [
+            {"plato": "ENSALADA CAESAR", "cantidad": 2, "precio_total": 17.99},
+        ]
+        state["registros"] = {
+            "C1": {},
+            "C2": {},
+            "LINEA": {
+                "POLLO 160 gr CECAR": {"conteo": 2, "ingreso": 0, "salida": 0, "motivo": ""},
+            },
+        }
+        state["consumo"] = [
+            {
+                "plato": "ENSALADA CAESAR",
+                "cantidad_platos": 2,
+                "insumo": "POLLO 160 gr CECAR",
+                "sku": "SKU",
+                "cantidad_por_plato": 1,
+                "cantidad_total": 2,
+                "unidad": "UND",
+                "ubicacion": "LINEA",
+            },
+        ]
+        preparacion = {
+            "fecha": "2026-03-14",
+            "avisos": [{
+                "ubicacion": "LINEA",
+                "insumo": "POLLO 160 gr CECAR",
+                "cambios": {"conteo": 2},
+            }],
+        }
+
+        resultado = motor.confirmar_registro_corregido(preparacion)
+
+        self.assertIn("REGISTRO REVISADO", resultado)
+        self.assertEqual(len(state["registro_updates"]), 0)
+        self.assertEqual(len(state["inventario_writes"]), 1)
+        self.assertEqual(state["inventario_writes"][0][4], "final_ticket")
+
+
 class PrepararCorreccionTests(unittest.TestCase):
     def test_preparar_correccion_muestra_preview_sin_escribir(self):
         motor, state = cargar_motor()
@@ -1013,6 +1716,7 @@ class PrepararCorreccionTests(unittest.TestCase):
         self.assertTrue(prep["ok"])
         self.assertIn("PREVIEW DE CORRECCIÓN", prep["resumen"])
         self.assertIn("HAMBURGUESA (180gr)", prep["resumen"])
+        self.assertIn("por favor no edites manualmente las hojas", prep["resumen"])
         self.assertEqual(state["inventario_writes"], [])
 
     def test_preparar_correccion_falla_sin_insumos(self):

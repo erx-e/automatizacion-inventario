@@ -116,6 +116,47 @@ Regla:
 - recalcular solo los insumos pedidos
 - volver a leer diferencias reales al final
 
+### 7. Aviso de corrección manual de registros
+
+Usar cuando el usuario dice que el personal de cocina registró mal un dato, ya corrigió la hoja manualmente y ahora quiere que el sistema relea registros y vuelva a cuadrar el inventario:
+
+- `conteo`
+- `ingreso`
+- `salida`
+- `motivo`
+
+Secuencia:
+
+1. Leer registros actuales del día.
+2. Pedir al usuario un aviso claro con ubicación, columna, insumo y valor final.
+3. Confirmar que la edición manual ya se hizo en la hoja.
+4. Releer registros del día.
+5. Si ya hay ventas cargadas en `VENTAS NEOLA`, recalcular inventario con esas ventas actuales.
+6. Si todavía no hay ventas cargadas, recalcular inventario solo desde registros.
+7. Leer diferencias finales.
+8. Reportar si quedó alguna diferencia o si quedó cuadrado.
+
+Formato recomendado para el aviso del usuario:
+
+- `Se corrigió el registro de {insumo} en {ubicacion}, columna {columna}, valor final {valor}.`
+
+Ejemplos:
+
+- `Se corrigió el registro de POLLO 160 gr CECAR en LINEA, columna conteo, valor final 2.`
+- `Se corrigió el registro de FILETE DE POLLO 200 gr en C1, columna salida, valor final 4.`
+- `Se corrigió el registro de KLOBASA DE PRAGA en C2, columna motivo, valor final traslado a linea.`
+
+Campos permitidos:
+
+- `C1` y `C2`: `ingreso`, `salida`, `motivo`
+- `LINEA CALIENTE`: `conteo`, `ingreso`, `salida`, `motivo`
+
+Reglas de conversación:
+
+- si el usuario dice solo `congelador`, pedir que especifique `C1` o `C2`
+- si el aviso no incluye ubicación, columna, insumo y valor final, pedir únicamente lo que falte
+- OpenClaw no debe editar la hoja de registros: solo releerla después de la corrección manual
+
 ## Regla de fecha
 
 - Si el usuario da una fecha exacta, usar esa fecha.

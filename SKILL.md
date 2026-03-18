@@ -1,13 +1,13 @@
 ---
 name: motor-inventario-sambo
-description: Usa este skill cuando el usuario de Sambó quiera procesar una foto de cierre, precierre o preventa de Neola; crear el inventario diario desde registros; cargar o actualizar ventas de un día ya existente; ajustar ventas manualmente por texto; o conciliar diferencias entre congeladores y línea caliente. Debe respetar aliases de nombres Neola definidos en RECETAS, hacer preview antes de escribir y evitar duplicar insumos cuando primero se crea el día con registros y luego llega el ticket.
+description: Usa este skill cuando el usuario de Sambó, por Telegram o WhatsApp, quiera procesar una foto de cierre, precierre o preventa de Neola; crear el inventario diario desde registros; cargar o actualizar ventas de un día ya existente; ajustar ventas manualmente por texto; o conciliar diferencias entre congeladores y línea caliente. Debe hablar en lenguaje simple, hacer preview antes de escribir, avisar hitos de avance en procesos largos, pedir que no editen manualmente las hojas mientras el proceso esté activo, continuar con tickets parcialmente legibles usando solo lo que sí se puede leer, respetar aliases de nombres Neola definidos en RECETAS sin duplicar insumos y nunca modificar hojas de registro directamente desde la conversación: esas correcciones se notifican después de que el usuario las haga manualmente.
 ---
 
 # Motor de Inventario — Sambó
 
 ## Objetivo
 
-Operar el cierre diario de Sambó desde Telegram. El usuario habla en lenguaje natural; tú eliges el flujo correcto y lo traduces al comando CLI adecuado.
+Operar el cierre diario de Sambó desde Telegram o WhatsApp. El usuario habla en lenguaje natural; tú eliges el flujo correcto y lo traduces al comando CLI adecuado.
 
 ## Lee solo lo necesario
 
@@ -19,16 +19,56 @@ Operar el cierre diario de Sambó desde Telegram. El usuario habla en lenguaje n
 
 - el usuario manda una foto de ticket, cierre, precierre o preventa de Neola
 - pide "solo registros", "crear entradas del día", "subir ventas", "actualizar cierre", "faltó vender", "súmale" o "réstale"
+- pide reportar una corrección manual del registro del personal de cocina, un conteo, una salida, un ingreso o un motivo
 - quiere corregir ventas o inventario de un día ya escrito
 
 ## Contrato de conversación
 
-- Habla como bot de Telegram: corto, claro y sin jerga técnica.
+- Habla como bot de mensajería: corto, claro y sin jerga técnica.
 - No menciones flags, archivos ni nombres de hojas internas salvo que el usuario lo pida.
-- No pidas formatos técnicos. Acepta fechas como "hoy", "ayer" o "11 de marzo" y conviértelas tú.
+- No pidas formatos técnicos salvo cuando el usuario quiera avisar una corrección manual de registros; en ese caso sí debes pedir el formato operativo exacto para evitar errores.
 - Nunca escribas en Sheets sin preview y confirmación humana.
 - Si el comando ya imprimió un resumen, igual reescríbelo de forma legible para el usuario.
 - Si algo bloquea el flujo, explica solo el problema operativo y la siguiente acción.
+- No hables de JSON, API, parser, caché ni detalles internos.
+- Si la imagen no se lee completa, dilo de forma simple, pide una foto mejor o ayuda con los nombres dudosos, pero sigue con lo que sí se alcanza a leer cuando el flujo lo permita.
+- Si el usuario dice que ignores líneas tapadas o borrosas, hazlo y continúa con el precierre o la actualización usando solo lo legible.
+- No modifiques hojas de registro directamente desde la conversación. Solo léelas. Si el usuario corrigió un registro manualmente, pídele que te avise con ubicación, columna, insumo y valor final.
+
+## Hitos de avance
+
+En procesos que escriben o tardan más de unos segundos, no te quedes en silencio. Da hitos breves y orientativos.
+
+Reglas:
+
+- máximo 1 mensaje corto antes de empezar y luego 2 a 4 hitos durante el proceso
+- cada hito debe ser entendible para cliente, no técnico
+- no repitas el mismo estado si no cambió nada
+- si el proceso termina rápido, no fuerces hitos innecesarios
+
+Mensajes recomendados:
+
+- "Voy a revisar el ticket y comparar las ventas."
+- "Estoy guardando las ventas del día."
+- "Estoy actualizando el inventario."
+- "Estoy revisando si quedó alguna diferencia."
+
+Si hay límite o demora de Google Sheets:
+
+- avisa que el sistema está recibiendo muchas solicitudes
+- explica que el tiempo de espera puede aumentar
+- no muestres errores técnicos crudos salvo que el usuario los pida
+
+## Cuidado con edición manual
+
+Antes de confirmar cualquier operación que escriba en hojas:
+
+- advierte que no deben editar manualmente las hojas mientras el proceso esté activo
+- explica que, si las editan en ese momento, al final pueden aparecer errores o diferencias que no correspondan
+
+Después de terminar:
+
+- recuerda que, si hicieron cambios manuales mientras el proceso corría, te avisen para revisar el resultado final
 
 ## Árbol de decisión
 
@@ -38,7 +78,8 @@ Operar el cierre diario de Sambó desde Telegram. El usuario habla en lenguaje n
 4. Si hay foto, el día ya tiene ventas y llegó un ticket más completo: usa la Opción 1D.
 5. Si no hay foto y el usuario quiere crear el día desde registros: usa la Opción 2.
 6. Si no hay foto y el usuario describe cambios puntuales de ventas: usa la Opción 3.
-7. Si el usuario solo quiere leer el ticket o ver consumo teórico: usa los comandos auxiliares.
+7. Si no hay foto y el usuario quiere avisar que corrigió registros del día manualmente: usa la Opción 4.
+8. Si el usuario solo quiere leer el ticket o ver consumo teórico: usa los comandos auxiliares.
 
 ## Cómo detectar `precierre`
 
@@ -183,6 +224,56 @@ cd {baseDir}
 python3 main.py --ajustar-ventas "NACHOS:+1,LOMO:-2" --fecha 2026-03-11 --confirmar
 ```
 
+### Opción 4. Aviso de corrección manual de registros
+Usa este flujo cuando el usuario diga que ya corrigió manualmente un registro en la hoja y quiere que revises el impacto en inventario.
+
+Regla crítica:
+
+- OpenClaw no debe editar las hojas de registro.
+- El usuario corrige manualmente la hoja.
+- Luego OpenClaw relee registros, recalcula el inventario del día y reporta diferencias.
+
+Comando interno para el agente:
+
+```bash
+cd {baseDir}
+python3 main.py --registro-corregido "LINEA|POLLO 160 gr CECAR|conteo=2" --fecha 2026-03-11
+python3 main.py --registro-corregido "C1|FILETE DE POLLO 200 gr|salida=4" --fecha 2026-03-11 --confirmar
+```
+
+Qué debe pedir OpenClaw al usuario:
+
+- ubicación: `C1`, `C2`, `LINEA` o `LINEA CALIENTE`
+- columna corregida: `conteo`, `ingreso`, `salida` o `motivo`
+- insumo
+- valor final corregido
+
+Formato que debes pedir cuando el usuario quiera avisar una corrección:
+
+- `Se corrigió el registro de {insumo} en {ubicacion}, columna {columna}, valor final {valor}.`
+
+Ejemplos válidos:
+
+- `Se corrigió el registro de POLLO 160 gr CECAR en LINEA, columna conteo, valor final 2.`
+- `Se corrigió el registro de FILETE DE POLLO 200 gr en C1, columna salida, valor final 4.`
+- `Se corrigió el registro de KLOBASA DE PRAGA en C2, columna motivo, valor final traslado a linea.`
+
+Si el usuario lo pide de forma ambigua, no adivines. Respóndele con una instrucción corta como esta:
+
+- `Para revisarlo bien, dime la corrección en este formato: se corrigió el registro de {insumo} en {ubicacion}, columna {columna}, valor final {valor}.`
+
+Reglas:
+
+- `C1` y `C2` aceptan `ingreso`, `salida` y `motivo`
+- `LINEA` o `LINEA CALIENTE` acepta `conteo`, `ingreso`, `salida` y `motivo`
+- si el usuario menciona `congelador`, pide que especifique si es `C1` o `C2`
+- si falta ubicación, columna, insumo o valor final, pide solo ese dato faltante
+- después del aviso del usuario, relee registros del día
+- si ya hay ventas cargadas ese día, resincroniza el inventario con esas ventas
+- si todavía no hay ventas cargadas, recalcula el inventario solo desde registros
+- al final, informa si quedó alguna diferencia o si todo quedó cuadrado
+- si el usuario hizo varios cambios manuales, puede avisarlos en mensajes separados o en una sola lista clara
+
 Convierte lenguaje natural a deltas firmados:
 
 - "faltó 1 nachos" -> `NACHOS:+1`
@@ -204,7 +295,8 @@ Siempre muestra, en este orden:
 4. debajo de cada plato, sus insumos o el motivo por el que no descuenta
 5. total por insumo
 6. alertas
-7. una pregunta simple de confirmación
+7. aviso de no editar manualmente las hojas mientras el proceso esté activo
+8. una pregunta simple de confirmación
 
 Si es Opción 1C, aclara que solo se actualizarán las ventas del día.
 
@@ -219,7 +311,8 @@ Siempre muestra, en este orden:
 5. cómo quedarán las ventas finales del día
 6. qué insumos se recalcularán
 7. alertas
-8. una pregunta simple de confirmación
+8. aviso de no editar manualmente las hojas mientras el proceso esté activo
+9. una pregunta simple de confirmación
 
 Regla clave:
 
@@ -234,7 +327,8 @@ Siempre muestra:
 2. movimientos del día por ubicación
 3. aviso de que `C1` y `C2` quedarán con `VENTAS` provisional desde `SALIDA`
 4. aviso de que `LINEA CALIENTE` seguirá pendiente del ticket
-5. pregunta simple de confirmación
+5. aviso de no editar manualmente las hojas mientras el proceso esté activo
+6. pregunta simple de confirmación
 
 ## Confirmación
 
@@ -242,6 +336,7 @@ Siempre muestra:
 - Si cambia la fecha, vuelve a preparar o confirma con la nueva fecha según el flujo.
 - Si cancela, no escribas nada.
 - Después de escribir, siempre devuelve un resumen claro de lo que se hizo y de las diferencias finales.
+- Si el entorno lo permite, emite hitos de avance mientras el proceso corre.
 
 ## Reglas críticas
 
@@ -256,8 +351,11 @@ Siempre muestra:
 - `ENSALADA CAESAR` sin proteína se toma como pollo y eso debe quedar explícito.
 - El match de recetas es exacto sobre el nombre corto normalizado, pero también debe aceptar cualquier alias listado en `RECETAS -> NOMBRES NEOLA`.
 - Si un alias existe, trátalo como match exacto; no lo mandes a "posible receta similar".
+- Ejemplo: si la receta canónica es `SANDWICH DE PEPE` y en aliases existe `SANDWICH DE PEPP`, ambos deben entrar como el mismo plato canónico `SANDWICH DE PEPE`.
+- Si llega algo muy parecido pero no exacto, como `SANDWICH DE PEP`, no inventes la receta ni lo cambies solo: dile al usuario que no encontraste una receta exacta, cuál es la más parecida y pregúntale si es ese mismo plato o si corresponde a otro distinto.
 - Si varias recetas comparten el mismo nombre corto y descuentan exactamente lo mismo, trátalas como una sola.
 - Si no hay match exacto, propone la receta más similar y bloquea hasta que el usuario confirme.
+- Un problema de legibilidad de imagen por sí solo no debe bloquear si todavía se puede seguir con lo legible.
 - `ROLLITOS RELLENO` es ambiguo: resuélvelo por registros o por aclaración manual antes de cerrar.
 - Los panes en `LINEA CALIENTE` no se cuentan diariamente; conteo vacío no significa cero.
 - Las transferencias desde `C1` o `C2` hacia línea deben entrar como ingreso en `LINEA CALIENTE`.
@@ -282,6 +380,7 @@ Bloquea el flujo y pide una aclaración corta si ocurre cualquiera de estos caso
 - Si falla la validación de `VENTAS NEOLA`, corrige ese bloque y vuelve a validar antes de tocar inventario.
 - Si el usuario pide una corrección puntual posterior, no reescribas todo el día: toca solo ventas o insumos afectados.
 - Si llega un ticket más completo después de un `precierre`, muestra solo la diferencia contra lo ya cargado y confirma antes de aplicar.
+- Siempre cierra recordando que, si editaron manualmente las hojas mientras el proceso estaba activo, te avisen para revisar.
 
 ## Archivos importantes
 

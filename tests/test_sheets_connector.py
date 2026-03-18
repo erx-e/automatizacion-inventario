@@ -224,6 +224,174 @@ class LeerRegistroDiaTests(unittest.TestCase):
         self.assertEqual(leer_mock.call_args.kwargs, {})
 
 
+class ActualizarRegistrosDiaTests(unittest.TestCase):
+    def test_actualiza_salida_y_motivo_en_c1(self):
+        class Worksheet:
+            def __init__(self):
+                self.row_count = 10
+                self.col_count = 8
+                self.title = "REGISTRO C1"
+
+        ws = Worksheet()
+        rows = [
+            ["MARZO"],
+            ["REGISTRO C1", "", "10-03-2026"],
+            ["INSUMO", "UND", "INGRESO", "SALIDA", "MOTIVO"],
+            ["FILETE DE POLLO 200 gr", "UND", "", "5", ""],
+        ]
+
+        with mock.patch.object(
+            sheets_connector,
+            "_obtener_worksheet",
+            return_value=ws,
+        ), mock.patch.object(
+            sheets_connector,
+            "_leer_valores_hoja",
+            return_value=rows,
+        ), mock.patch.object(
+            sheets_connector,
+            "_batch_update_user_entered",
+        ) as batch_mock:
+            actualizados = sheets_connector.actualizar_registros_dia(
+                "2026-03-10",
+                [{
+                    "ubicacion": "C1",
+                    "insumo": "FILETE DE POLLO 200 gr",
+                    "cambios": {"salida": 4, "motivo": "correccion"},
+                }],
+            )
+
+        self.assertEqual(actualizados, {"C1": ["FILETE DE POLLO 200 gr"], "C2": [], "LINEA": []})
+        self.assertEqual(
+            batch_mock.call_args.args[1],
+            [
+                {"range": "R4C4:R4C4", "values": [[4]]},
+                {"range": "R4C5:R4C5", "values": [["correccion"]]},
+            ],
+        )
+
+    def test_actualiza_conteo_en_linea(self):
+        class Worksheet:
+            def __init__(self):
+                self.row_count = 10
+                self.col_count = 8
+                self.title = "REGISTRO LINEA CALIENTE"
+
+        ws = Worksheet()
+        rows = [
+            ["MARZO"],
+            ["REGISTRO LINEA CALIENTE", "", "10-03-2026"],
+            ["INSUMO", "UND", "CONTEO", "INGRESO", "SALIDA", "MOTIVO"],
+            ["POLLO 160 gr CECAR", "UND", "3", "", "", ""],
+        ]
+
+        with mock.patch.object(
+            sheets_connector,
+            "_obtener_worksheet",
+            return_value=ws,
+        ), mock.patch.object(
+            sheets_connector,
+            "_leer_valores_hoja",
+            return_value=rows,
+        ), mock.patch.object(
+            sheets_connector,
+            "_batch_update_user_entered",
+        ) as batch_mock:
+            actualizados = sheets_connector.actualizar_registros_dia(
+                "2026-03-10",
+                [{
+                    "ubicacion": "LINEA",
+                    "insumo": "POLLO 160 gr CECAR",
+                    "cambios": {"conteo": 2},
+                }],
+            )
+
+        self.assertEqual(actualizados, {"C1": [], "C2": [], "LINEA": ["POLLO 160 gr CECAR"]})
+        self.assertEqual(
+            batch_mock.call_args.args[1],
+            [{"range": "R4C3:R4C3", "values": [[2]]}],
+        )
+
+
+class ScopedCacheSheetsTests(unittest.TestCase):
+    def setUp(self):
+        sheets_connector._spreadsheet_cache.clear()
+        sheets_connector._worksheet_cache.clear()
+        sheets_connector._master_cache.clear()
+
+    def test_leer_registros_dia_completo_reutiliza_lecturas_en_misma_operacion(self):
+        hojas = {
+            "REGISTRO C1": types.SimpleNamespace(row_count=20, col_count=8, title="REGISTRO C1"),
+            "REGISTRO C2": types.SimpleNamespace(row_count=20, col_count=8, title="REGISTRO C2"),
+            "REGISTRO LINEA CALIENTE": types.SimpleNamespace(row_count=20, col_count=8, title="REGISTRO LINEA CALIENTE"),
+        }
+        sh = types.SimpleNamespace(worksheet=lambda hoja_nombre: hojas[hoja_nombre])
+        gc = types.SimpleNamespace(open_by_key=lambda key: sh)
+        rows = [
+            ["MARZO"],
+            ["REGISTRO", "", "10-03-2026"],
+            ["INSUMO", "UND", "INGRESO", "SALIDA", "MOTIVO"],
+            ["POLLO 200 gr", "UND", "", "2", ""],
+        ]
+
+        with mock.patch.object(sheets_connector, "get_client", return_value=gc), mock.patch.object(
+            sheets_connector,
+            "_leer_valores_hoja",
+            return_value=rows,
+        ) as leer_mock:
+            cache = {}
+            primero = sheets_connector.leer_registros_dia_completo("2026-03-10", cache=cache)
+            segundo = sheets_connector.leer_registros_dia_completo("2026-03-10", cache=cache)
+
+        self.assertEqual(primero, segundo)
+        self.assertEqual(leer_mock.call_count, 3)
+
+    def test_escribir_ventas_invalida_cache_del_dia(self):
+        ventas = [{"plato": "HAMBURGUESA GOLD", "cantidad": 1, "precio_total": 9.99}]
+        consumo = [
+            {"plato": "HAMBURGUESA GOLD", "insumo": "HAMBURGUESA (180gr)", "cantidad_total": 1},
+        ]
+        rows_escritos = sheets_connector._construir_filas_ventas_neola("2026-03-13", ventas, consumo)
+
+        class Worksheet:
+            def __init__(self):
+                self.row_count = 10
+                self.col_count = sheets_connector.COLUMNAS_VENTAS_NEOLA
+                self.id = 123
+
+            def update(self, range_name, values):
+                return None
+
+        ws = Worksheet()
+        sh = types.SimpleNamespace(worksheet=lambda hoja_nombre: ws, batch_update=lambda payload: None)
+        gc = types.SimpleNamespace(open_by_key=lambda key: sh)
+        hoja_vacia = [[""] * sheets_connector.COLUMNAS_VENTAS_NEOLA for _ in range(ws.row_count)]
+        hoja_actualizada = [list(row) for row in hoja_vacia]
+        hoja_actualizada[0] = rows_escritos[0]
+        hoja_actualizada[1] = rows_escritos[1]
+
+        with mock.patch.object(sheets_connector, "get_client", return_value=gc), mock.patch.object(
+            sheets_connector,
+            "_leer_valores_hoja",
+            side_effect=[
+                hoja_vacia,
+                hoja_vacia,
+                rows_escritos,
+                hoja_actualizada,
+            ],
+        ):
+            cache = {}
+            antes = sheets_connector.leer_ventas_neola_dia("2026-03-13", cache=cache)
+            sheets_connector.escribir_ventas_neola("2026-03-13", ventas, consumo, cache=cache)
+            despues = sheets_connector.leer_ventas_neola_dia("2026-03-13", cache=cache)
+
+        self.assertEqual(antes, [])
+        self.assertEqual(
+            despues,
+            [{"plato": "HAMBURGUESA GOLD", "cantidad": 1, "precio_total": 0.0}],
+        )
+
+
 class VentasEsperadasTests(unittest.TestCase):
     def test_solo_registros_congelador_usa_salida_registrada_como_ventas_provisionales(self):
         consumo_por_hoja = {"C1": {}, "C2": {"CREPE POLLO 2 unid": 2}, "LINEA": {}}
@@ -570,6 +738,68 @@ class UserEnteredWriteTests(unittest.TestCase):
         self.assertEqual(ws.calls, [{"data": payload, "raw": False}])
 
 
+class EscribirInventarioDiaTests(unittest.TestCase):
+    def test_crea_dia_nuevo_sin_exigir_fecha_existente_antes_del_encabezado(self):
+        class Worksheet:
+            def __init__(self, title):
+                self.title = title
+                self.id = 1
+
+            def col_values(self, col):
+                if col == 1:
+                    return ["", "", "", "POLLO 200 gr", ""]
+                if col == 6:
+                    return ["", "", "", "10", ""]
+                return []
+
+            def batch_update(self, data):
+                return None
+
+        hojas = {
+            "C1": Worksheet("C1"),
+            "C2": Worksheet("C2"),
+            "LINEA CALIENTE": Worksheet("LINEA CALIENTE"),
+        }
+        sh = types.SimpleNamespace(worksheet=lambda hoja_nombre: hojas[hoja_nombre])
+        gc = types.SimpleNamespace(open_by_key=lambda key: sh)
+        writes = []
+
+        with mock.patch.object(sheets_connector, "get_client", return_value=gc), mock.patch.object(
+            sheets_connector,
+            "leer_tabla_ubicacion_descuento",
+            return_value={},
+        ), mock.patch.object(
+            sheets_connector,
+            "_buscar_seccion_mes_inventario",
+            return_value=(1, 2, 3, 4, 4),
+        ), mock.patch.object(
+            sheets_connector,
+            "_buscar_bloque_fecha_inventario",
+            return_value=None,
+        ), mock.patch.object(
+            sheets_connector,
+            "_buscar_bloque_siguiente_inventario",
+            return_value=(1, 7),
+        ), mock.patch.object(
+            sheets_connector,
+            "_copiar_bloque_inventario",
+            return_value=None,
+        ), mock.patch.object(
+            sheets_connector,
+            "_batch_update_user_entered",
+            side_effect=lambda ws, data: writes.append((ws.title, data)),
+        ):
+            sheets_connector.escribir_inventario_dia(
+                "2026-03-14",
+                {},
+                {"C1": {}, "C2": {}, "LINEA": {}},
+                {},
+                cache={},
+            )
+
+        self.assertEqual(len(writes), 3)
+
+
 class CorregirInventarioInsumosTests(unittest.TestCase):
     def test_corrige_insumos_objetivo_con_sufijos_en_filas_de_inventario(self):
         class Worksheet:
@@ -593,7 +823,7 @@ class CorregirInventarioInsumosTests(unittest.TestCase):
         cierres = ["", "10", "8", "5"]
         writes = []
 
-        def contexto(ws, fecha):
+        def contexto(ws, fecha, cache=None):
             return 7, 2, 4, 1, productos, cierres
 
         def batch_update(ws, data):

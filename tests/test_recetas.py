@@ -84,8 +84,9 @@ class PlatosIgnoradosTests(unittest.TestCase):
 
         self.assertEqual(consumo, [])
         self.assertEqual(len(alertas), 1)
-        self.assertIn("Posible receta similar", alertas[0])
+        self.assertIn("No encontré una receta exacta", alertas[0])
         self.assertIn("TABLA QUESOS EMB", alertas[0])
+        self.assertIn("¿Es ese mismo plato?", alertas[0])
 
     def test_no_aplica_match_por_prefijo_sin_confirmacion(self):
         ventas = [
@@ -107,7 +108,7 @@ class PlatosIgnoradosTests(unittest.TestCase):
 
         self.assertEqual(consumo, [])
         self.assertEqual(len(alertas), 1)
-        self.assertIn("Posible receta similar", alertas[0])
+        self.assertIn("No encontré una receta exacta", alertas[0])
         self.assertIn("HAMBURGUESA ARTE", alertas[0])
 
     def test_resuelve_nombre_corto_duplicado_con_la_variante_mas_cercana(self):

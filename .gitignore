@@ -6,7 +6,7 @@ __pycache__/
 .pytest_cache/
 *.pyc
 *.pyo
-
+.jpg
 # Secretos locales
 golden-sambo-inventario-*.json
 google-service-account.json

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # main.py — Punto de entrada para probar el motor localmente
+import csv
 import sys
 from config import validar_configuracion
 from motor import (
@@ -10,7 +11,13 @@ from motor import (
     preparar_solo_ventas, confirmar_solo_ventas,
     preparar_actualizacion_ticket, confirmar_actualizacion_ticket,
     preparar_ajuste_ventas, confirmar_ajuste_ventas,
+    preparar_ajuste_registros, confirmar_ajuste_registros,
+    preparar_registro_corregido, confirmar_registro_corregido,
 )
+
+
+def _mostrar_progreso_usuario(mensaje: str) -> None:
+    print(f"\n⏳ {mensaje}", flush=True)
 
 
 def _leer_rollitos_override(argv: list[str]) -> dict | None:
@@ -43,7 +50,13 @@ def _leer_insumos(argv: list[str], flag: str) -> list[str] | None:
     if idx + 1 >= len(argv):
         raise ValueError(f"Falta valor para {flag}")
 
-    insumos = [item.strip() for item in argv[idx + 1].split(",") if item.strip()]
+    raw = argv[idx + 1]
+    try:
+        partes = next(csv.reader([raw], skipinitialspace=True))
+    except Exception:
+        partes = raw.split(",")
+
+    insumos = [item.strip() for item in partes if item.strip()]
     if not insumos:
         raise ValueError(f"Debes indicar al menos un insumo en {flag}")
     return insumos
@@ -96,6 +109,60 @@ def _leer_ajustes_ventas(argv: list[str]) -> list[dict] | None:
     return ajustes
 
 
+def _leer_cambios_registro(argv: list[str], flag: str) -> list[dict] | None:
+    if flag not in argv:
+        return None
+
+    idx = argv.index(flag)
+    if idx + 1 >= len(argv):
+        raise ValueError(f"Falta valor para {flag}")
+
+    ajustes = []
+    for bloque in argv[idx + 1].split(";"):
+        bloque = bloque.strip()
+        if not bloque:
+            continue
+
+        partes = [item.strip() for item in bloque.split("|") if item.strip()]
+        if len(partes) < 3:
+            raise ValueError(
+                "Cada ajuste de registro debe usar el formato UBICACION|INSUMO|campo=valor"
+            )
+
+        ubicacion = partes[0]
+        insumo = partes[1]
+        cambios = {}
+        for parte in partes[2:]:
+            if "=" not in parte:
+                raise ValueError(
+                    "Cada ajuste de registro debe usar el formato UBICACION|INSUMO|campo=valor"
+                )
+            campo, valor = parte.split("=", 1)
+            campo = campo.strip().lower()
+            valor = valor.strip()
+            if campo not in {"conteo", "ingreso", "salida", "motivo"}:
+                raise ValueError(f"Campo inválido en {flag}: {campo!r}")
+
+            if campo == "motivo":
+                cambios[campo] = valor
+                continue
+
+            try:
+                cambios[campo] = int(valor)
+            except ValueError as exc:
+                raise ValueError(f"Valor inválido para {campo}: {valor!r}") from exc
+
+        ajustes.append({
+            "ubicacion": ubicacion,
+            "insumo": insumo,
+            "cambios": cambios,
+        })
+
+    if not ajustes:
+        raise ValueError(f"Debes indicar al menos un ajuste en {flag}")
+    return ajustes
+
+
 def _confirmar_interactivo(callback) -> None:
     if not sys.stdin.isatty():
         return
@@ -118,10 +185,17 @@ def main():
         print("  python3 main.py <imagen> --solo-ventas        → Solo cargar ventas a entrada existente")
         print("  python3 main.py --solo-registros              → Inventario solo desde registros (sin foto)")
         print("  python3 main.py --ajustar-ventas 'NACHOS:+1,LOMO:-2'")
+        print("  python3 main.py --ajustar-registros 'LINEA|POLLO 160 gr CECAR|conteo=2|motivo=correccion'")
+        print("  python3 main.py --registro-corregido 'LINEA|POLLO 160 gr CECAR|conteo=2'")
         print("  python3 main.py <imagen> --fecha 2026-03-11   → Con fecha específica")
         sys.exit(1)
 
-    requiere_anthropic = "--solo-registros" not in sys.argv and "--ajustar-ventas" not in sys.argv
+    requiere_anthropic = (
+        "--solo-registros" not in sys.argv
+        and "--ajustar-ventas" not in sys.argv
+        and "--ajustar-registros" not in sys.argv
+        and "--registro-corregido" not in sys.argv
+    )
     try:
         validar_configuracion(requiere_anthropic=requiere_anthropic)
     except EnvironmentError as e:
@@ -137,13 +211,17 @@ def main():
         if not prep["ok"]:
             return
         if confirmar:
-            print("\n" + confirmar_inventario_registros(prep))
+            print("\n" + confirmar_inventario_registros(prep, on_progress=_mostrar_progreso_usuario))
         else:
-            _confirmar_interactivo(lambda: confirmar_inventario_registros(prep))
+            _confirmar_interactivo(
+                lambda: confirmar_inventario_registros(prep, on_progress=_mostrar_progreso_usuario)
+            )
         return
 
     try:
         ajustes_ventas = _leer_ajustes_ventas(sys.argv)
+        ajustes_registros = _leer_cambios_registro(sys.argv, "--ajustar-registros")
+        avisos_registro = _leer_cambios_registro(sys.argv, "--registro-corregido")
     except ValueError as e:
         print(f"❌ {str(e)}")
         sys.exit(1)
@@ -156,9 +234,41 @@ def main():
         if not prep["ok"]:
             return
         if confirmar:
-            print("\n" + confirmar_ajuste_ventas(prep))
+            print("\n" + confirmar_ajuste_ventas(prep, on_progress=_mostrar_progreso_usuario))
         else:
-            _confirmar_interactivo(lambda: confirmar_ajuste_ventas(prep))
+            _confirmar_interactivo(
+                lambda: confirmar_ajuste_ventas(prep, on_progress=_mostrar_progreso_usuario)
+            )
+        return
+
+    if ajustes_registros is not None:
+        fecha = _leer_fecha(sys.argv)
+        confirmar = "--confirmar" in sys.argv
+        prep = preparar_ajuste_registros(fecha=fecha, ajustes=ajustes_registros)
+        print(prep["resumen"])
+        if not prep["ok"]:
+            return
+        if confirmar:
+            print("\n" + confirmar_ajuste_registros(prep, on_progress=_mostrar_progreso_usuario))
+        else:
+            _confirmar_interactivo(
+                lambda: confirmar_ajuste_registros(prep, on_progress=_mostrar_progreso_usuario)
+            )
+        return
+
+    if avisos_registro is not None:
+        fecha = _leer_fecha(sys.argv)
+        confirmar = "--confirmar" in sys.argv
+        prep = preparar_registro_corregido(fecha=fecha, avisos=avisos_registro)
+        print(prep["resumen"])
+        if not prep["ok"]:
+            return
+        if confirmar:
+            print("\n" + confirmar_registro_corregido(prep, on_progress=_mostrar_progreso_usuario))
+        else:
+            _confirmar_interactivo(
+                lambda: confirmar_registro_corregido(prep, on_progress=_mostrar_progreso_usuario)
+            )
         return
 
     if len(sys.argv) < 2 or sys.argv[1].startswith("--"):
@@ -202,9 +312,19 @@ def main():
             return
         confirmar = "--confirmar" in sys.argv
         if confirmar:
-            print("\n" + confirmar_solo_ventas(prep, image_path=image_path))
+            print("\n" + confirmar_solo_ventas(
+                prep,
+                image_path=image_path,
+                on_progress=_mostrar_progreso_usuario,
+            ))
         else:
-            _confirmar_interactivo(lambda: confirmar_solo_ventas(prep, image_path=image_path))
+            _confirmar_interactivo(
+                lambda: confirmar_solo_ventas(
+                    prep,
+                    image_path=image_path,
+                    on_progress=_mostrar_progreso_usuario,
+                )
+            )
         return
 
     if "--actualizar-ticket" in sys.argv:
@@ -219,9 +339,19 @@ def main():
             return
         confirmar = "--confirmar" in sys.argv
         if confirmar:
-            print("\n" + confirmar_actualizacion_ticket(prep, image_path=image_path))
+            print("\n" + confirmar_actualizacion_ticket(
+                prep,
+                image_path=image_path,
+                on_progress=_mostrar_progreso_usuario,
+            ))
         else:
-            _confirmar_interactivo(lambda: confirmar_actualizacion_ticket(prep, image_path=image_path))
+            _confirmar_interactivo(
+                lambda: confirmar_actualizacion_ticket(
+                    prep,
+                    image_path=image_path,
+                    on_progress=_mostrar_progreso_usuario,
+                )
+            )
         return
 
     if "--preparar" in sys.argv:
@@ -247,6 +377,7 @@ def main():
                 prep,
                 image_path=image_path,
                 rollitos_override=rollitos_override,
+                on_progress=_mostrar_progreso_usuario,
             ))
         elif respuesta.startswith("fecha "):
             nueva_fecha = respuesta.replace("fecha ", "").strip()
@@ -256,6 +387,7 @@ def main():
                 fecha_override=nueva_fecha,
                 image_path=image_path,
                 rollitos_override=rollitos_override,
+                on_progress=_mostrar_progreso_usuario,
             ))
         else:
             print("❌ Cierre cancelado.")
@@ -277,7 +409,7 @@ def main():
 
         respuesta = input("\n> ").strip().lower()
         if respuesta == "si":
-            print("\n" + confirmar_correccion(prep))
+            print("\n" + confirmar_correccion(prep, on_progress=_mostrar_progreso_usuario))
         else:
             print("❌ Corrección cancelada.")
         return
@@ -288,6 +420,7 @@ def main():
             fecha=fecha,
             insumos=insumos_correccion,
             rollitos_override=rollitos_override,
+            on_progress=_mostrar_progreso_usuario,
         ))
         return
 
@@ -297,6 +430,7 @@ def main():
         fecha=fecha,
         rollitos_override=rollitos_override,
         precierre=precierre,
+        on_progress=_mostrar_progreso_usuario,
     ))
 
 

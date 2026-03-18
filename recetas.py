@@ -252,9 +252,10 @@ def calcular_consumo_teorico(ventas: list[dict], recetas: list[dict]) -> tuple[l
             sugerencia = sugerir_receta_similar(plato, recetas)
             if sugerencia:
                 alertas.append(
-                    f"❓ Posible receta similar: en recetas existe '{sugerencia}', "
-                    f"pero en el ticket sale '{plato}'. "
-                    f"¿Cambio el nombre de la receta a '{plato}' y aplico esa receta?"
+                    f"❓ No encontré una receta exacta para '{plato}'. "
+                    f"La más parecida es '{sugerencia}'. "
+                    "¿Es ese mismo plato? Si sí, lo tomo con esa receta. "
+                    "Si no, dime si es otro nombre del mismo plato o si corresponde a una receta distinta."
                 )
             else:
                 alertas.append(f"⚠️ Plato sin receta: {plato} x{cantidad_vendida}")

@@ -5,7 +5,11 @@ import shutil
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from config import UMBRAL_DESCUADRE
-from parser_neola import parsear_foto_ticket, parsear_foto_bytes
+from parser_neola import (
+    obtener_diagnostico_lectura,
+    parsear_foto_ticket,
+    parsear_foto_bytes,
+)
 from recetas import (
     agrupar_consumo_por_insumo,
     buscar_receta,
@@ -21,7 +25,7 @@ from sheets_connector import (
     leer_registros_dia_completo, escribir_ventas_neola,
     escribir_inventario_dia, leer_diferencias_inventario_dia,
     corregir_inventario_insumos, verificar_inventario_dia_existe,
-    leer_ventas_neola_dia,
+    leer_ventas_neola_dia, actualizar_registros_dia,
 )
 
 # Zona horaria de Ecuador (UTC-5)
@@ -238,8 +242,9 @@ def _preparar_datos_cierre(ventas_originales: list[dict], fecha: str, recetas: l
                            rollitos_override: dict | None = None,
                            registros: dict | None = None,
                            permitir_pendiente_rollitos: bool = False) -> dict:
+    ventas_canonicas = _canonizar_ventas_segun_recetas(ventas_originales, recetas)
     ventas_resueltas, alertas_rollitos, requiere_aclaracion = _resolver_rollitos_rellenos(
-        ventas_originales,
+        ventas_canonicas,
         fecha,
         registros=registros,
         rollitos_override=rollitos_override,
@@ -271,9 +276,70 @@ def _agrupar_ventas_por_plato(ventas: list[dict]) -> list[dict]:
     return list(agrupadas.values())
 
 
-def _mapa_ventas_por_plato(ventas: list[dict]) -> dict[str, dict]:
+def _plato_canonico_neola(plato: str, recetas: list[dict] | None = None) -> str:
+    nombre = str(plato or "").strip()
+    if not nombre or not recetas:
+        return nombre
+
+    recetas_plato = buscar_receta(nombre, recetas)
+    if not recetas_plato:
+        return nombre
+
+    canonicos = []
+    vistos = set()
+    for receta in recetas_plato:
+        canonico = str(receta.get("plato", "")).strip()
+        if not canonico:
+            continue
+        clave = normalizar_nombre(canonico)
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        canonicos.append(canonico)
+
+    if len(canonicos) == 1:
+        return canonicos[0]
+
+    recetas_resueltas, alertas = resolver_variantes_receta(nombre, recetas_plato)
+    if alertas:
+        return nombre
+
+    canonicos_resueltos = []
+    vistos_resueltos = set()
+    for receta in recetas_resueltas:
+        canonico = str(receta.get("plato", "")).strip()
+        if not canonico:
+            continue
+        clave = normalizar_nombre(canonico)
+        if clave in vistos_resueltos:
+            continue
+        vistos_resueltos.add(clave)
+        canonicos_resueltos.append(canonico)
+
+    if len(canonicos_resueltos) == 1:
+        return canonicos_resueltos[0]
+
+    return nombre
+
+
+def _canonizar_ventas_segun_recetas(ventas: list[dict], recetas: list[dict] | None = None) -> list[dict]:
     agrupadas = {}
     for venta in ventas:
+        plato = _plato_canonico_neola(venta.get("plato", ""), recetas)
+        if plato not in agrupadas:
+            agrupadas[plato] = {
+                "plato": plato,
+                "cantidad": 0,
+                "precio_total": 0.0,
+            }
+        agrupadas[plato]["cantidad"] += int(venta.get("cantidad", 0) or 0)
+        agrupadas[plato]["precio_total"] += float(venta.get("precio_total", 0) or 0)
+    return list(agrupadas.values())
+
+
+def _mapa_ventas_por_plato(ventas: list[dict], recetas: list[dict] | None = None) -> dict[str, dict]:
+    agrupadas = {}
+    for venta in _canonizar_ventas_segun_recetas(ventas, recetas):
         plato = venta["plato"]
         if plato not in agrupadas:
             agrupadas[plato] = {
@@ -290,9 +356,13 @@ def _lista_ventas_desde_mapa(mapa_ventas: dict[str, dict]) -> list[dict]:
     return [venta for venta in mapa_ventas.values() if venta["cantidad"] > 0]
 
 
-def _calcular_cambios_ventas(ventas_actuales: list[dict], ventas_nuevas: list[dict]) -> list[dict]:
-    mapa_actual = _mapa_ventas_por_plato(ventas_actuales)
-    mapa_nuevo = _mapa_ventas_por_plato(ventas_nuevas)
+def _calcular_cambios_ventas(
+    ventas_actuales: list[dict],
+    ventas_nuevas: list[dict],
+    recetas: list[dict] | None = None,
+) -> list[dict]:
+    mapa_actual = _mapa_ventas_por_plato(ventas_actuales, recetas=recetas)
+    mapa_nuevo = _mapa_ventas_por_plato(ventas_nuevas, recetas=recetas)
 
     cambios = []
     for plato in sorted(set(mapa_actual) | set(mapa_nuevo)):
@@ -331,8 +401,12 @@ def _insumos_afectados(consumo_actual: dict, consumo_nuevo: dict) -> list[str]:
     return afectados
 
 
-def _aplicar_ajustes_ventas(ventas_actuales: list[dict], ajustes: list[dict]) -> list[dict]:
-    mapa_actual = _mapa_ventas_por_plato(ventas_actuales)
+def _aplicar_ajustes_ventas(
+    ventas_actuales: list[dict],
+    ajustes: list[dict],
+    recetas: list[dict] | None = None,
+) -> list[dict]:
+    mapa_actual = _mapa_ventas_por_plato(ventas_actuales, recetas=recetas)
     mapa_normalizado = {
         normalizar_nombre(plato): plato
         for plato in mapa_actual
@@ -340,8 +414,9 @@ def _aplicar_ajustes_ventas(ventas_actuales: list[dict], ajustes: list[dict]) ->
 
     for ajuste in ajustes:
         plato_original = ajuste["plato"].strip()
-        clave_normalizada = normalizar_nombre(plato_original)
-        plato = mapa_normalizado.get(clave_normalizada, plato_original)
+        plato_canonico = _plato_canonico_neola(plato_original, recetas)
+        clave_normalizada = normalizar_nombre(plato_canonico)
+        plato = mapa_normalizado.get(clave_normalizada, plato_canonico)
         delta = int(ajuste["delta"])
 
         if plato not in mapa_actual:
@@ -451,6 +526,365 @@ def _hay_alertas_de_receta_por_confirmar(alertas: list[str]) -> bool:
     return any(alerta.startswith("❓") for alerta in alertas)
 
 
+def _normalizar_contexto(contexto: dict | None) -> dict:
+    if contexto is None:
+        return {}
+    return contexto
+
+
+def _ctx_get(contexto: dict | None, clave, loader):
+    if contexto is None:
+        return loader()
+    cache = contexto.setdefault("_cache", {})
+    if clave not in cache:
+        cache[clave] = loader()
+    return cache[clave]
+
+
+def _ctx_sheets_cache(contexto: dict | None) -> dict | None:
+    if contexto is None:
+        return None
+    return contexto.setdefault("_sheets_cache", {})
+
+
+def _ctx_get_recetas(contexto: dict | None) -> list[dict]:
+    return _ctx_get(
+        contexto,
+        "recetas",
+        lambda: leer_recetas(cache=_ctx_sheets_cache(contexto)),
+    )
+
+
+def _ctx_get_ubicaciones(contexto: dict | None) -> dict:
+    return _ctx_get(
+        contexto,
+        "ubicaciones",
+        lambda: leer_ubicacion_descuento(cache=_ctx_sheets_cache(contexto)),
+    )
+
+
+def _ctx_get_registros(contexto: dict | None, fecha: str) -> dict:
+    return _ctx_get(
+        contexto,
+        ("registros", fecha),
+        lambda: leer_registros_dia_completo(fecha, cache=_ctx_sheets_cache(contexto)),
+    )
+
+
+def _ctx_get_ventas_neola(contexto: dict | None, fecha: str) -> list[dict]:
+    return _ctx_get(
+        contexto,
+        ("ventas_neola", fecha),
+        lambda: leer_ventas_neola_dia(fecha, cache=_ctx_sheets_cache(contexto)),
+    )
+
+
+def _ctx_get_existencia_inventario(contexto: dict | None, fecha: str) -> dict[str, bool]:
+    return _ctx_get(
+        contexto,
+        ("existencia_inventario", fecha),
+        lambda: verificar_inventario_dia_existe(fecha, cache=_ctx_sheets_cache(contexto)),
+    )
+
+
+def _normalizar_ubicacion_registro(ubicacion: str) -> str:
+    valor = normalizar_nombre(str(ubicacion or ""))
+    alias = {
+        "C1": "C1",
+        "C2": "C2",
+        "LINEA": "LINEA",
+        "LINEA CALIENTE": "LINEA",
+    }
+    return alias.get(valor, "")
+
+
+def _registro_vacio(ubicacion_key: str) -> dict:
+    return {
+        "conteo": None if ubicacion_key == "LINEA" else None,
+        "ingreso": 0,
+        "salida": 0,
+        "motivo": "",
+    }
+
+
+def _copiar_registros(registros: dict) -> dict:
+    return {
+        ubicacion: {
+            insumo: dict(datos)
+            for insumo, datos in (registros.get(ubicacion, {}) or {}).items()
+        }
+        for ubicacion in ("C1", "C2", "LINEA")
+    }
+
+
+def _valor_registro_para_mostrar(campo: str, valor):
+    if campo == "motivo":
+        return valor if str(valor).strip() else "vacío"
+    if campo == "conteo":
+        return "vacío" if valor is None else valor
+    return valor
+
+
+def _aplicar_ajustes_registros(registros_actuales: dict, ajustes: list[dict]) -> tuple[dict, list[dict]]:
+    nuevos = _copiar_registros(registros_actuales)
+    cambios = []
+
+    for ajuste in ajustes:
+        ubicacion_key = _normalizar_ubicacion_registro(ajuste.get("ubicacion"))
+        if ubicacion_key not in nuevos:
+            raise ValueError(f"Ubicación de registro no válida: {ajuste.get('ubicacion')}")
+
+        insumo = str(ajuste.get("insumo", "")).strip()
+        if not insumo:
+            raise ValueError("Cada ajuste de registro debe indicar un insumo.")
+
+        actual = dict(nuevos[ubicacion_key].get(insumo) or _registro_vacio(ubicacion_key))
+        antes = dict(actual)
+
+        for campo, valor in ajuste.get("cambios", {}).items():
+            if campo == "conteo" and ubicacion_key != "LINEA":
+                raise ValueError(f"'{insumo}' en {ubicacion_key} no usa conteo.")
+            if campo not in ("conteo", "ingreso", "salida", "motivo"):
+                raise ValueError(f"Campo de registro no válido: {campo}")
+
+            if campo == "motivo":
+                actual[campo] = str(valor).strip()
+                continue
+
+            if valor is None:
+                actual[campo] = None if campo == "conteo" else 0
+                continue
+
+            numero = int(valor)
+            if numero < 0:
+                raise ValueError(f"El ajuste deja '{insumo}' con {campo} negativo ({numero}).")
+            actual[campo] = numero
+
+        if (
+            actual.get("conteo") is None
+            and actual.get("ingreso", 0) == 0
+            and actual.get("salida", 0) == 0
+            and not actual.get("motivo", "")
+        ):
+            nuevos[ubicacion_key].pop(insumo, None)
+        else:
+            nuevos[ubicacion_key][insumo] = actual
+
+        cambios.append({
+            "ubicacion": ubicacion_key,
+            "insumo": insumo,
+            "antes": antes,
+            "despues": dict(nuevos[ubicacion_key].get(insumo) or _registro_vacio(ubicacion_key)),
+        })
+
+    return nuevos, cambios
+
+
+def _formatear_cambios_registro(cambios: list[dict]) -> list[str]:
+    lineas = []
+    for cambio in cambios:
+        hoja = "LINEA CALIENTE" if cambio["ubicacion"] == "LINEA" else cambio["ubicacion"]
+        lineas.append(f"   • {hoja} / {cambio['insumo']}")
+        for campo in ("conteo", "ingreso", "salida", "motivo"):
+            antes = cambio["antes"].get(campo)
+            despues = cambio["despues"].get(campo)
+            if antes == despues:
+                continue
+            lineas.append(
+                f"      - {campo}: {_valor_registro_para_mostrar(campo, antes)} → "
+                f"{_valor_registro_para_mostrar(campo, despues)}"
+            )
+    return lineas
+
+
+def _resolver_insumo_en_registros(registros_ubicacion: dict, insumo: str) -> str | None:
+    objetivo = normalizar_nombre(str(insumo or ""))
+    for nombre_real in registros_ubicacion.keys():
+        if normalizar_nombre(nombre_real) == objetivo:
+            return nombre_real
+    return None
+
+
+def _verificar_avisos_registros(registros_actuales: dict, avisos: list[dict]) -> tuple[list[dict], list[dict]]:
+    confirmados = []
+    diferencias = []
+
+    for aviso in avisos:
+        ubicacion_key = _normalizar_ubicacion_registro(aviso.get("ubicacion"))
+        if ubicacion_key not in ("C1", "C2", "LINEA"):
+            raise ValueError(f"Ubicación de registro no válida: {aviso.get('ubicacion')}")
+
+        insumo = str(aviso.get("insumo", "")).strip()
+        if not insumo:
+            raise ValueError("Cada aviso de registro corregido debe indicar un insumo.")
+
+        nombre_real = _resolver_insumo_en_registros(registros_actuales.get(ubicacion_key, {}), insumo)
+        actual = dict(
+            (registros_actuales.get(ubicacion_key, {}) or {}).get(nombre_real)
+            or _registro_vacio(ubicacion_key)
+        )
+
+        cambios_confirmados = []
+        for campo, valor_esperado in aviso.get("cambios", {}).items():
+            if campo == "conteo" and ubicacion_key != "LINEA":
+                raise ValueError(f"'{insumo}' en {ubicacion_key} no usa conteo.")
+            if campo not in ("conteo", "ingreso", "salida", "motivo"):
+                raise ValueError(f"Campo de registro no válido: {campo}")
+
+            if campo == "motivo":
+                esperado = str(valor_esperado).strip()
+            elif valor_esperado is None:
+                esperado = None if campo == "conteo" else 0
+            else:
+                esperado = int(valor_esperado)
+                if esperado < 0:
+                    raise ValueError(f"El valor final de '{insumo}' para {campo} no puede ser negativo.")
+
+            valor_actual = actual.get(campo)
+            cambios_confirmados.append({
+                "campo": campo,
+                "actual": valor_actual,
+                "esperado": esperado,
+            })
+
+            if valor_actual != esperado:
+                diferencias.append({
+                    "ubicacion": ubicacion_key,
+                    "insumo": nombre_real or insumo,
+                    "campo": campo,
+                    "actual": valor_actual,
+                    "esperado": esperado,
+                })
+
+        confirmados.append({
+            "ubicacion": ubicacion_key,
+            "insumo": nombre_real or insumo,
+            "campos": cambios_confirmados,
+        })
+
+    return confirmados, diferencias
+
+
+def _formatear_confirmaciones_registro(confirmados: list[dict]) -> list[str]:
+    lineas = []
+    for confirmado in confirmados:
+        hoja = "LINEA CALIENTE" if confirmado["ubicacion"] == "LINEA" else confirmado["ubicacion"]
+        lineas.append(f"   • {hoja} / {confirmado['insumo']}")
+        for campo in confirmado["campos"]:
+            lineas.append(
+                f"      - {campo['campo']}: "
+                f"{_valor_registro_para_mostrar(campo['campo'], campo['esperado'])}"
+            )
+    return lineas
+
+
+def _formatear_diferencias_aviso_registro(diferencias: list[dict]) -> list[str]:
+    lineas = []
+    for item in diferencias:
+        hoja = "LINEA CALIENTE" if item["ubicacion"] == "LINEA" else item["ubicacion"]
+        lineas.append(
+            f"   • {hoja} / {item['insumo']} / {item['campo']}: "
+            f"en la hoja veo {_valor_registro_para_mostrar(item['campo'], item['actual'])} "
+            f"y me indicaste {_valor_registro_para_mostrar(item['campo'], item['esperado'])}"
+        )
+    return lineas
+
+
+def _es_error_de_limite(exc: Exception) -> bool:
+    texto = str(exc).upper()
+    marcadores = (
+        "429",
+        "QUOTA EXCEEDED",
+        "RATE LIMIT",
+        "RESOURCE_EXHAUSTED",
+        "READ REQUESTS PER MINUTE PER USER",
+        "WRITE REQUESTS PER MINUTE PER USER",
+        "TOO MANY REQUESTS",
+    )
+    return any(marker in texto for marker in marcadores)
+
+
+def _mensaje_limite_para_cliente() -> str:
+    return (
+        "⏳ El sistema está recibiendo muchas solicitudes en este momento. "
+        "El tiempo de espera puede aumentar por el uso de la aplicación. "
+        "Espera un momento y vuelve a intentarlo."
+    )
+
+
+def _formatear_error_usuario(prefijo: str, exc: Exception) -> str:
+    if _es_error_de_limite(exc):
+        return f"{prefijo}. {_mensaje_limite_para_cliente()}"
+    return f"{prefijo}: {str(exc)}"
+
+
+def _mensaje_cuidado_hojas() -> str:
+    return (
+        "⚠️ Mientras este proceso esté activo, por favor no edites manualmente las hojas. "
+        "Si las cambias en ese momento, al final pueden aparecer errores o diferencias que no correspondan. "
+        "Si necesitas hacerlo, avísame cuando termine para revisarlo."
+    )
+
+
+def _recordatorio_edicion_manual() -> str:
+    return (
+        "Si hiciste algún cambio manual en las hojas mientras el proceso estaba activo, "
+        "avísame para revisar que no haya quedado ningún error por eso."
+    )
+
+
+def _emitir_progreso(on_progress, mensaje: str) -> None:
+    if not on_progress:
+        return
+    try:
+        on_progress(mensaje)
+    except Exception:
+        pass
+
+
+def _alertas_lectura_para_cliente(diagnostico: dict) -> list[str]:
+    if not diagnostico.get("problema") and not diagnostico.get("platos_dudosos"):
+        return []
+
+    alertas = ["⚠️ La foto no se ve del todo clara en algunas partes."]
+    platos_dudosos = diagnostico.get("platos_dudosos", [])
+    if platos_dudosos:
+        alertas.append(f"⚠️ No pude leer con seguridad estos nombres: {', '.join(platos_dudosos)}.")
+    elif diagnostico.get("requiere_aclaracion"):
+        alertas.append("⚠️ Puede faltar algún plato porque una parte del ticket no se alcanza a leer bien.")
+    return alertas
+
+
+def _sugerencias_lectura_para_cliente(diagnostico: dict) -> list[str]:
+    if not diagnostico.get("problema") and not diagnostico.get("platos_dudosos"):
+        return []
+
+    platos_dudosos = diagnostico.get("platos_dudosos", [])
+    lineas = ["Si puedes, envíame una foto más clara."]
+    if platos_dudosos:
+        lineas.append(f"Si no, ayúdame a confirmar estos nombres: {', '.join(platos_dudosos)}.")
+        lineas.append("También dime si en el preview de arriba falta algún plato.")
+    else:
+        lineas.append("Si no, revisa el preview de arriba y dime si falta algún plato o si alguno quedó mal leído.")
+    return lineas
+
+
+def _parsear_ticket_desde_imagen(
+    *,
+    image_path: str = None,
+    image_bytes: bytes = None,
+    media_type: str = "image/jpeg",
+) -> tuple[list[dict], dict]:
+    if image_bytes:
+        ventas = parsear_foto_bytes(image_bytes, media_type)
+    elif image_path:
+        ventas = parsear_foto_ticket(image_path)
+    else:
+        raise ValueError("No se recibió imagen del ticket")
+
+    return ventas, obtener_diagnostico_lectura()
+
+
 def sugerir_fecha() -> tuple[str, str]:
     """
     Sugiere la fecha del cierre basándose en la hora actual en Ecuador.
@@ -480,7 +914,8 @@ def sugerir_fecha() -> tuple[str, str]:
 def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
                      media_type: str = "image/jpeg", fecha: str = None,
                      rollitos_override: dict | None = None,
-                     precierre: bool = False) -> dict:
+                     precierre: bool = False,
+                     contexto: dict | None = None) -> dict:
     """
     PASO 1 del flujo: parsea la foto, calcula consumo teórico, sugiere fecha.
     NO escribe nada en Google Sheets. Devuelve un dict con toda la info
@@ -499,11 +934,14 @@ def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
             "resumen": "texto para mostrar al usuario"
         }
     """
+    contexto = _normalizar_contexto(contexto)
     resultado = {
         "ok": False,
         "fecha": "",
         "fecha_motivo": "",
         "fecha_origen": "",
+        "diagnostico_lectura": {},
+        "observaciones_lectura": [],
         "ventas_originales": [],
         "ventas": [],
         "consumo": [],
@@ -528,30 +966,31 @@ def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
 
     # Parsear foto
     try:
-        if image_bytes:
-            ventas = parsear_foto_bytes(image_bytes, media_type)
-        elif image_path:
-            ventas = parsear_foto_ticket(image_path)
-        else:
-            resultado["resumen"] = "❌ No se recibió imagen del ticket"
-            return resultado
+        ventas, diagnostico_lectura = _parsear_ticket_desde_imagen(
+            image_path=image_path,
+            image_bytes=image_bytes,
+            media_type=media_type,
+        )
     except Exception as e:
-        resultado["resumen"] = f"❌ Error al leer el ticket: {str(e)}"
+        resultado["resumen"] = _formatear_error_usuario("❌ Error al leer el ticket", e)
         return resultado
 
+    alertas_lectura = _alertas_lectura_para_cliente(diagnostico_lectura)
+    resultado["diagnostico_lectura"] = diagnostico_lectura
+    resultado["observaciones_lectura"] = alertas_lectura
     resultado["ventas_originales"] = list(ventas)
 
     # Calcular consumo teórico
     try:
-        recetas = leer_recetas()
+        recetas = _ctx_get_recetas(contexto)
     except Exception as e:
-        resultado["resumen"] = f"❌ Error al leer recetas: {str(e)}"
+        resultado["resumen"] = _formatear_error_usuario("❌ Error al leer recetas", e)
         return resultado
 
     registros = None
     if _cantidad_rollitos_ambiguos(ventas):
         try:
-            registros = leer_registros_dia_completo(resultado["fecha"])
+            registros = _ctx_get_registros(contexto, resultado["fecha"])
         except Exception:
             registros = None
 
@@ -565,7 +1004,7 @@ def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
     resultado["ventas"] = datos["ventas"]
     resultado["consumo"] = datos["consumo"]
     resultado["consumo_agrupado"] = datos["consumo_agrupado"]
-    resultado["alertas"] = datos["alertas"]
+    resultado["alertas"] = alertas_lectura + datos["alertas"]
     requiere_receta = _hay_alertas_de_receta_por_confirmar(resultado["alertas"])
     resultado["requiere_aclaracion"] = datos["requiere_aclaracion"] or requiere_receta
     resultado["ok"] = not resultado["requiere_aclaracion"]
@@ -595,18 +1034,27 @@ def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
         for a in resultado["alertas"]:
             lineas.append(f"   {a}")
 
+    sugerencias_lectura = _sugerencias_lectura_para_cliente(diagnostico_lectura)
+    if sugerencias_lectura:
+        lineas.append("\n💬 Si quieres afinar la lectura:")
+        for sugerencia in sugerencias_lectura:
+            lineas.append(f"   {sugerencia}")
+
     if resultado["requiere_aclaracion"]:
         lineas.append(f"\n{'=' * 40}")
         if any("Rollitos rellenos ambiguos" in alerta for alerta in resultado["alertas"]):
             lineas.append("❌ No se puede continuar hasta aclarar los rollitos rellenos.")
             lineas.append("¿Cuántos fueron de pollo y cuántos de queso?")
         elif requiere_receta:
-            lineas.append("❌ Hay un plato que no coincide exactamente con las recetas.")
-            lineas.append("Confirma si la receta sugerida es correcta para poder continuar.")
+            lineas.append("❌ Hay un plato que no pude relacionar con seguridad con una receta.")
+            lineas.append("Revisa la sugerencia de arriba y dime si es ese mismo plato o si corresponde a otro distinto.")
         else:
             lineas.append("❌ No se puede continuar hasta aclarar la información pendiente.")
     else:
         lineas.append(f"\n{'=' * 40}")
+        if sugerencias_lectura:
+            lineas.append("Puedo seguir con el precierre tomando solo lo que sí se alcanza a leer.")
+        lineas.append(_mensaje_cuidado_hojas())
         lineas.append("¿Todo correcto? ¿Procedo con el cierre?")
 
     resultado["resumen"] = "\n".join(lineas)
@@ -615,18 +1063,23 @@ def preparar_cierre(image_path: str = None, image_bytes: bytes = None,
 
 def confirmar_cierre(preparacion: dict, fecha_override: str = None,
                      image_path: str = None, image_bytes: bytes = None,
-                     rollitos_override: dict | None = None) -> str:
+                     rollitos_override: dict | None = None,
+                     contexto: dict | None = None,
+                     on_progress=None) -> str:
     """
     PASO 2 del flujo: ejecuta el cierre con los datos ya preparados.
     Se llama después de que el usuario confirma.
     Guarda la imagen del ticket en cierres-diarios/{fecha}/{fecha}.ext
     """
     fecha = fecha_override or preparacion["fecha"]
+    contexto = _normalizar_contexto(contexto)
+    sheets_cache = _ctx_sheets_cache(contexto)
+    _emitir_progreso(on_progress, "Estoy revisando los datos del día.")
 
     try:
-        recetas = leer_recetas()
+        recetas = _ctx_get_recetas(contexto)
     except Exception as e:
-        return f"❌ Error al leer recetas: {str(e)}"
+        return _formatear_error_usuario("❌ Error al leer recetas", e)
 
     # Guardar imagen del cierre
     _guardar_imagen_cierre(fecha, image_path, image_bytes)
@@ -638,9 +1091,9 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
     # Leer registros del día
     reporte.append("\n📦 Leyendo registros del día...")
     try:
-        registros = leer_registros_dia_completo(fecha)
+        registros = _ctx_get_registros(contexto, fecha)
     except Exception as e:
-        reporte.append(f"⚠️ No se pudieron leer registros: {str(e)}")
+        reporte.append(_formatear_error_usuario("⚠️ No se pudieron leer registros", e))
         registros = {"C1": {}, "C2": {}, "LINEA": {}}
 
     ventas_originales = preparacion.get("ventas_originales", preparacion["ventas"])
@@ -680,9 +1133,9 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
 
     # Ubicaciones de descuento
     try:
-        ubicaciones_defecto = leer_ubicacion_descuento()
+        ubicaciones_defecto = _ctx_get_ubicaciones(contexto)
     except Exception as e:
-        reporte.append(f"⚠️ No se pudo leer tabla de ubicaciones: {str(e)}")
+        reporte.append(_formatear_error_usuario("⚠️ No se pudo leer tabla de ubicaciones", e))
         ubicaciones_defecto = {}
 
     # Conciliar
@@ -744,24 +1197,27 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
 
     ventas_ok = False
     try:
-        escribir_ventas_neola(fecha, ventas, consumo)
+        _emitir_progreso(on_progress, "Estoy guardando las ventas del día.")
+        escribir_ventas_neola(fecha, ventas, consumo, cache=sheets_cache)
         ventas_ok = True
         reporte.append("✅ Ventas Neola actualizado")
     except Exception as e:
-        reporte.append(f"⚠️ Error al guardar ventas: {str(e)}")
+        reporte.append(_formatear_error_usuario("⚠️ Error al guardar ventas", e))
 
     if ventas_ok:
         try:
+            _emitir_progreso(on_progress, "Estoy actualizando el inventario.")
             escribir_inventario_dia(
                 fecha,
                 consumo_agrupado,
                 registros,
                 ubicaciones_defecto,
                 modo_ventas="final_ticket",
+                cache=sheets_cache,
             )
             reporte.append("✅ Inventario diario actualizado")
         except Exception as e:
-            reporte.append(f"⚠️ Error al guardar inventario: {str(e)}")
+            reporte.append(_formatear_error_usuario("⚠️ Error al guardar inventario", e))
     else:
         reporte.append("⚠️ Inventario no actualizado porque no se pudo corregir automaticamente VENTAS NEOLA.")
 
@@ -785,10 +1241,11 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
             reporte.append(f"   • {insumo}: {datos['total']} {datos['unidad']}")
 
     try:
-        diferencias_finales = leer_diferencias_inventario_dia(fecha)
+        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        diferencias_finales = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
     except Exception as e:
         diferencias_finales = None
-        reporte.append(f"\n⚠️ No se pudieron leer las diferencias finales del inventario: {str(e)}")
+        reporte.append("\n" + _formatear_error_usuario("⚠️ No se pudieron leer las diferencias finales del inventario", e))
 
     if diferencias_finales is not None:
         total_diferencias = sum(len(items) for items in diferencias_finales.values())
@@ -837,6 +1294,9 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
         for a in alertas_recetas:
             reporte.append(f"   {a}")
 
+    reporte.append("")
+    reporte.append(_recordatorio_edicion_manual())
+
     # Guardar historial JSON del cierre
     _guardar_historial_cierre(
         fecha,
@@ -855,8 +1315,10 @@ def confirmar_cierre(preparacion: dict, fecha_override: str = None,
 def preparar_correccion(image_path: str = None, image_bytes: bytes = None,
                         media_type: str = "image/jpeg", fecha: str = None,
                         insumos: list[str] | None = None,
-                        rollitos_override: dict | None = None) -> dict:
+                        rollitos_override: dict | None = None,
+                        contexto: dict | None = None) -> dict:
     """Preview de corrección puntual sin escribir en Google Sheets."""
+    contexto = _normalizar_contexto(contexto)
     if not insumos:
         return {"ok": False, "resumen": "❌ Debes indicar al menos un insumo para corregir."}
 
@@ -869,15 +1331,16 @@ def preparar_correccion(image_path: str = None, image_bytes: bytes = None,
         media_type=media_type,
         fecha=fecha,
         rollitos_override=rollitos_override,
+        contexto=contexto,
     )
     if not prep["ok"]:
         return prep
 
     try:
-        registros = leer_registros_dia_completo(fecha)
-        ubicaciones = leer_ubicacion_descuento()
+        registros = _ctx_get_registros(contexto, fecha)
+        ubicaciones = _ctx_get_ubicaciones(contexto)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer datos: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer datos", e)}
 
     consumo_agrupado = prep["consumo_agrupado"]
     insumos_por_hoja = {"C1": [], "C2": [], "LINEA CALIENTE": []}
@@ -899,6 +1362,7 @@ def preparar_correccion(image_path: str = None, image_bytes: bytes = None,
             lineas.append(f"   • {hoja}: {insumo_nombre} (ventas teóricas: {ventas_teoricas})")
 
     lineas.append(f"\n{'=' * 40}")
+    lineas.append(_mensaje_cuidado_hojas())
     lineas.append("¿Confirmar corrección? (si/no)")
 
     return {
@@ -912,19 +1376,25 @@ def preparar_correccion(image_path: str = None, image_bytes: bytes = None,
     }
 
 
-def confirmar_correccion(preparacion: dict) -> str:
+def confirmar_correccion(preparacion: dict, contexto: dict | None = None,
+                         on_progress=None) -> str:
     """Ejecuta la corrección puntual con los datos ya preparados."""
     fecha = preparacion["fecha"]
     insumos = preparacion["insumos"]
+    contexto = _normalizar_contexto(contexto)
+    sheets_cache = _ctx_sheets_cache(contexto)
 
     try:
+        _emitir_progreso(on_progress, "Estoy corrigiendo los insumos indicados.")
         actualizados = corregir_inventario_insumos(
             fecha, insumos, preparacion["consumo_agrupado"],
             preparacion["registros"], preparacion["ubicaciones"],
+            cache=sheets_cache,
         )
-        diferencias = leer_diferencias_inventario_dia(fecha)
+        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
     except Exception as e:
-        return f"❌ Error al corregir inventario puntual: {str(e)}"
+        return _formatear_error_usuario("❌ Error al corregir inventario puntual", e)
 
     lineas = [f"🛠️ CORRECCIÓN PUNTUAL DE INVENTARIO — {fecha}"]
     for hoja in ("C1", "C2", "LINEA CALIENTE"):
@@ -933,6 +1403,8 @@ def confirmar_correccion(preparacion: dict) -> str:
             lineas.append(f"{hoja}: {', '.join(insumos_hoja)}")
 
     lineas.extend(_formatear_diferencias_inventario(diferencias))
+    lineas.append("")
+    lineas.append(_recordatorio_edicion_manual())
     return "\n".join(lineas)
 
 
@@ -1011,11 +1483,11 @@ def _diagnosticar_diferencia_inventario(hoja: str, item: dict) -> str:
     )
 
 
-def _verificar_entrada_inventario(fecha: str) -> tuple[bool, str]:
+def _verificar_entrada_inventario(fecha: str, contexto: dict | None = None) -> tuple[bool, str]:
     try:
-        existencia = verificar_inventario_dia_existe(fecha)
+        existencia = _ctx_get_existencia_inventario(contexto, fecha)
     except Exception as e:
-        return False, f"❌ Error al verificar inventario: {str(e)}"
+        return False, _formatear_error_usuario("❌ Error al verificar inventario", e)
 
     hojas_faltantes = [hoja for hoja, existe in existencia.items() if not existe]
     if hojas_faltantes:
@@ -1039,8 +1511,10 @@ def _preparar_actualizacion_ventas(
     origen: str,
     descripcion: str,
     precierre: bool = False,
+    contexto: dict | None = None,
 ) -> dict:
-    ok_inventario, mensaje = _verificar_entrada_inventario(fecha)
+    contexto = _normalizar_contexto(contexto)
+    ok_inventario, mensaje = _verificar_entrada_inventario(fecha, contexto)
     if not ok_inventario:
         return {"ok": False, "resumen": mensaje}
 
@@ -1057,15 +1531,15 @@ def _preparar_actualizacion_ventas(
         }
 
     try:
-        ventas_actuales = leer_ventas_neola_dia(fecha)
+        ventas_actuales = _ctx_get_ventas_neola(contexto, fecha)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer ventas actuales: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer ventas actuales", e)}
 
     try:
-        registros = leer_registros_dia_completo(fecha)
-        ubicaciones = leer_ubicacion_descuento()
+        registros = _ctx_get_registros(contexto, fecha)
+        ubicaciones = _ctx_get_ubicaciones(contexto)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer datos del día: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer datos del día", e)}
 
     datos_actuales = _preparar_datos_cierre(
         ventas_actuales,
@@ -1073,7 +1547,7 @@ def _preparar_actualizacion_ventas(
         recetas,
         registros=registros,
     )
-    cambios = _calcular_cambios_ventas(ventas_actuales, ventas_finales)
+    cambios = _calcular_cambios_ventas(ventas_actuales, ventas_finales, recetas=recetas)
     if not cambios:
         return {
             "ok": False,
@@ -1086,12 +1560,15 @@ def _preparar_actualizacion_ventas(
     )
     historial_previo = _leer_historial_cierre(fecha) or {}
     ticket_tipo_previo = historial_previo.get("metadata", {}).get("ticket_tipo")
+    recalcular_inventario_completo = ticket_tipo_previo == "precierre" and not precierre
 
     lineas = [f"📋 {descripcion.upper()} — {fecha}", "=" * 40]
     if ticket_tipo_previo == "precierre":
         lineas.append("ℹ️ Este día estaba marcado previamente como precierre.")
     if precierre:
         lineas.append("🟡 El nuevo ticket se registrará como precierre.")
+    elif recalcular_inventario_completo:
+        lineas.append("ℹ️ Como este día venía de un precierre, se volverá a sincronizar todo el inventario.")
 
     lineas.append(f"\n🧾 Cambios detectados ({len(cambios)}):")
     lineas.extend(_formatear_cambios_ventas(cambios))
@@ -1117,6 +1594,7 @@ def _preparar_actualizacion_ventas(
             lineas.append(f"   {alerta}")
 
     lineas.append(f"\n{'=' * 40}")
+    lineas.append(_mensaje_cuidado_hojas())
     lineas.append("¿Todo correcto? ¿Aplico la actualización?")
 
     return {
@@ -1132,6 +1610,7 @@ def _preparar_actualizacion_ventas(
         "insumos_afectados": insumos_afectados,
         "registros": registros,
         "ubicaciones": ubicaciones,
+        "recalcular_inventario_completo": recalcular_inventario_completo,
         "resumen": "\n".join(lineas),
     }
 
@@ -1141,37 +1620,61 @@ def _confirmar_actualizacion_ventas(
     *,
     image_path: str = None,
     image_bytes: bytes = None,
+    contexto: dict | None = None,
+    on_progress=None,
 ) -> str:
     fecha = preparacion["fecha"]
+    contexto = _normalizar_contexto(contexto)
+    sheets_cache = _ctx_sheets_cache(contexto)
 
     try:
+        _emitir_progreso(on_progress, "Estoy actualizando las ventas del día.")
         escribir_ventas_neola(
             fecha,
             preparacion["ventas_finales"],
             preparacion["consumo_final"],
+            cache=sheets_cache,
         )
     except Exception as e:
-        return f"❌ Error al actualizar VENTAS NEOLA: {str(e)}"
+        return _formatear_error_usuario("❌ Error al actualizar VENTAS NEOLA", e)
 
-    if preparacion["insumos_afectados"]:
+    if preparacion.get("recalcular_inventario_completo"):
         try:
+            _emitir_progreso(on_progress, "Estoy actualizando todo el inventario del día.")
+            escribir_inventario_dia(
+                fecha,
+                preparacion["consumo_agrupado_final"],
+                preparacion["registros"],
+                preparacion["ubicaciones"],
+                modo_ventas="final_ticket",
+                cache=sheets_cache,
+            )
+        except Exception as e:
+            return _formatear_error_usuario("❌ Ventas actualizadas, pero falló la actualización completa del inventario", e)
+    elif preparacion["insumos_afectados"]:
+        try:
+            _emitir_progreso(on_progress, "Estoy recalculando solo lo que cambió en inventario.")
             corregir_inventario_insumos(
                 fecha,
                 preparacion["insumos_afectados"],
                 preparacion["consumo_agrupado_final"],
                 preparacion["registros"],
                 preparacion["ubicaciones"],
+                cache=sheets_cache,
             )
         except Exception as e:
-            return f"❌ Ventas actualizadas, pero falló la corrección de inventario: {str(e)}"
+            return _formatear_error_usuario("❌ Ventas actualizadas, pero falló la corrección de inventario", e)
 
     if image_path or image_bytes:
         _guardar_imagen_cierre(fecha, image_path=image_path, image_bytes=image_bytes)
 
     try:
-        diferencias = leer_diferencias_inventario_dia(fecha)
+        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
+        advertencia_diferencias = ""
     except Exception as e:
         diferencias = {"C1": [], "C2": [], "LINEA CALIENTE": []}
+        advertencia_diferencias = _formatear_error_usuario("⚠️ No se pudieron leer las diferencias finales del inventario", e)
 
     _guardar_historial_cierre(
         fecha,
@@ -1192,7 +1695,12 @@ def _confirmar_actualizacion_ventas(
         for insumo in preparacion["insumos_afectados"]:
             lineas.append(f"   • {insumo}")
 
+    if advertencia_diferencias:
+        lineas.append("")
+        lineas.append(advertencia_diferencias)
     lineas.extend(_formatear_diferencias_inventario(diferencias))
+    lineas.append("")
+    lineas.append(_recordatorio_edicion_manual())
     return "\n".join(lineas)
 
 
@@ -1203,7 +1711,9 @@ def _confirmar_actualizacion_ventas(
 def preparar_actualizacion_ticket(image_path: str = None, image_bytes: bytes = None,
                                   media_type: str = "image/jpeg", fecha: str = None,
                                   rollitos_override: dict | None = None,
-                                  precierre: bool = False) -> dict:
+                                  precierre: bool = False,
+                                  contexto: dict | None = None) -> dict:
+    contexto = _normalizar_contexto(contexto)
     if not fecha:
         fecha = sugerir_fecha()[0]
 
@@ -1214,14 +1724,15 @@ def preparar_actualizacion_ticket(image_path: str = None, image_bytes: bytes = N
         fecha=fecha,
         rollitos_override=rollitos_override,
         precierre=precierre,
+        contexto=contexto,
     )
     if not prep_ticket["ok"]:
         return prep_ticket
 
     try:
-        recetas = leer_recetas()
+        recetas = _ctx_get_recetas(contexto)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer recetas: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer recetas", e)}
 
     actualizacion = _preparar_actualizacion_ventas(
         fecha=fecha,
@@ -1234,6 +1745,7 @@ def preparar_actualizacion_ticket(image_path: str = None, image_bytes: bytes = N
         origen="ticket_nuevo",
         descripcion="Actualización desde ticket",
         precierre=precierre,
+        contexto=contexto,
     )
     if actualizacion.get("ok"):
         actualizacion["ventas_originales"] = prep_ticket.get("ventas_originales", prep_ticket["ventas"])
@@ -1241,15 +1753,21 @@ def preparar_actualizacion_ticket(image_path: str = None, image_bytes: bytes = N
 
 
 def confirmar_actualizacion_ticket(preparacion: dict, image_path: str = None,
-                                   image_bytes: bytes = None) -> str:
+                                   image_bytes: bytes = None,
+                                   contexto: dict | None = None,
+                                   on_progress=None) -> str:
     return _confirmar_actualizacion_ventas(
         preparacion,
         image_path=image_path,
         image_bytes=image_bytes,
+        contexto=contexto,
+        on_progress=on_progress,
     )
 
 
-def preparar_ajuste_ventas(fecha: str = None, ajustes: list[dict] | None = None) -> dict:
+def preparar_ajuste_ventas(fecha: str = None, ajustes: list[dict] | None = None,
+                           contexto: dict | None = None) -> dict:
+    contexto = _normalizar_contexto(contexto)
     if not ajustes:
         return {"ok": False, "resumen": "❌ Debes indicar al menos un ajuste de ventas."}
 
@@ -1257,20 +1775,20 @@ def preparar_ajuste_ventas(fecha: str = None, ajustes: list[dict] | None = None)
         fecha = sugerir_fecha()[0]
 
     try:
-        recetas = leer_recetas()
-        ventas_actuales = leer_ventas_neola_dia(fecha)
+        recetas = _ctx_get_recetas(contexto)
+        ventas_actuales = _ctx_get_ventas_neola(contexto, fecha)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer datos: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer datos", e)}
 
     try:
-        ventas_finales = _aplicar_ajustes_ventas(ventas_actuales, ajustes)
+        ventas_finales = _aplicar_ajustes_ventas(ventas_actuales, ajustes, recetas=recetas)
     except ValueError as e:
         return {"ok": False, "resumen": f"❌ {str(e)}"}
 
     try:
-        registros = leer_registros_dia_completo(fecha)
+        registros = _ctx_get_registros(contexto, fecha)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer registros: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer registros", e)}
 
     datos_finales = _preparar_datos_cierre(
         ventas_finales,
@@ -1289,32 +1807,401 @@ def preparar_ajuste_ventas(fecha: str = None, ajustes: list[dict] | None = None)
         recetas=recetas,
         origen="ajuste_manual",
         descripcion="Ajuste manual de ventas",
+        contexto=contexto,
     )
     if preparacion.get("ok"):
         preparacion["ajustes"] = ajustes
     return preparacion
 
 
-def confirmar_ajuste_ventas(preparacion: dict) -> str:
-    return _confirmar_actualizacion_ventas(preparacion)
+def confirmar_ajuste_ventas(preparacion: dict, contexto: dict | None = None,
+                            on_progress=None) -> str:
+    return _confirmar_actualizacion_ventas(
+        preparacion,
+        contexto=contexto,
+        on_progress=on_progress,
+    )
+
+
+# ============================================================
+# Ajuste de registros del día
+# ============================================================
+
+def preparar_ajuste_registros(fecha: str = None, ajustes: list[dict] | None = None,
+                              contexto: dict | None = None) -> dict:
+    contexto = _normalizar_contexto(contexto)
+    if not ajustes:
+        return {"ok": False, "resumen": "❌ Debes indicar al menos un ajuste de registro."}
+
+    if not fecha:
+        fecha = sugerir_fecha()[0]
+
+    try:
+        registros_actuales = _ctx_get_registros(contexto, fecha)
+        ventas_actuales = _ctx_get_ventas_neola(contexto, fecha)
+        ubicaciones = _ctx_get_ubicaciones(contexto)
+    except Exception as e:
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer datos del día", e)}
+
+    try:
+        registros_finales, cambios = _aplicar_ajustes_registros(registros_actuales, ajustes)
+    except ValueError as e:
+        return {"ok": False, "resumen": f"❌ {str(e)}"}
+
+    modo_ventas = "final_ticket" if ventas_actuales else "provisional_registros"
+    total_ventas = sum(venta.get("cantidad", 0) or 0 for venta in ventas_actuales)
+    recetas = []
+    consumo = []
+    consumo_agrupado = {}
+    alertas = []
+    if ventas_actuales:
+        try:
+            recetas = _ctx_get_recetas(contexto)
+        except Exception as e:
+            return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer recetas", e)}
+
+        datos = _preparar_datos_cierre(
+            ventas_actuales,
+            fecha,
+            recetas,
+            registros=registros_finales,
+        )
+        consumo = datos["consumo"]
+        consumo_agrupado = datos["consumo_agrupado"]
+        alertas = datos["alertas"]
+
+    lineas = [f"🛠️ AJUSTE DE REGISTROS — {fecha}", "=" * 40]
+    lineas.append(f"\nCambios a aplicar ({len(cambios)}):")
+    lineas.extend(_formatear_cambios_registro(cambios))
+
+    if ventas_actuales:
+        lineas.append("")
+        lineas.append(
+            f"Después de corregir los registros, se resincronizará el inventario usando "
+            f"las ventas ya cargadas ({total_ventas} unidades)."
+        )
+    else:
+        lineas.append("")
+        lineas.append("Todavía no hay ventas cargadas para ese día.")
+        lineas.append("El inventario se volverá a calcular solo desde registros.")
+        lineas.append("LINEA CALIENTE seguirá pendiente del ticket final.")
+
+    if alertas:
+        lineas.append("\n⚠️ Alertas:")
+        for alerta in alertas:
+            lineas.append(f"   {alerta}")
+
+    lineas.append(f"\n{'=' * 40}")
+    lineas.append(_mensaje_cuidado_hojas())
+    lineas.append("¿Todo correcto? ¿Aplico la corrección del registro?")
+
+    return {
+        "ok": True,
+        "fecha": fecha,
+        "ajustes": ajustes,
+        "cambios": cambios,
+        "registros_finales": registros_finales,
+        "ventas_actuales": ventas_actuales,
+        "consumo_agrupado": consumo_agrupado,
+        "ubicaciones": ubicaciones,
+        "modo_ventas": modo_ventas,
+        "resumen": "\n".join(lineas),
+    }
+
+
+def confirmar_ajuste_registros(preparacion: dict, contexto: dict | None = None,
+                               on_progress=None) -> str:
+    fecha = preparacion["fecha"]
+    contexto = _normalizar_contexto(contexto)
+    sheets_cache = _ctx_sheets_cache(contexto)
+
+    try:
+        _emitir_progreso(on_progress, "Estoy actualizando los registros del día.")
+        actualizados = actualizar_registros_dia(fecha, preparacion["ajustes"], cache=sheets_cache)
+    except Exception as e:
+        return _formatear_error_usuario("❌ Error al actualizar los registros", e)
+
+    try:
+        registros_actualizados = leer_registros_dia_completo(fecha)
+        ventas_actuales = leer_ventas_neola_dia(fecha)
+        ubicaciones = leer_ubicacion_descuento()
+    except Exception as e:
+        return _formatear_error_usuario("❌ Registros actualizados, pero no se pudieron releer los datos", e)
+
+    modo_ventas = "final_ticket" if ventas_actuales else "provisional_registros"
+    consumo_agrupado = {}
+    if ventas_actuales:
+        try:
+            recetas = leer_recetas()
+            datos = _preparar_datos_cierre(
+                ventas_actuales,
+                fecha,
+                recetas,
+                registros=registros_actualizados,
+            )
+            consumo_agrupado = datos["consumo_agrupado"]
+        except Exception as e:
+            return _formatear_error_usuario("❌ Registros actualizados, pero falló el recálculo de consumo", e)
+
+    try:
+        _emitir_progreso(on_progress, "Estoy actualizando el inventario con los registros corregidos.")
+        escribir_inventario_dia(
+            fecha,
+            consumo_agrupado,
+            registros_actualizados,
+            ubicaciones,
+            modo_ventas=modo_ventas,
+            cache=sheets_cache,
+        )
+    except Exception as e:
+        return _formatear_error_usuario("❌ Registros actualizados, pero falló la actualización del inventario", e)
+
+    try:
+        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
+        advertencia = ""
+    except Exception as e:
+        diferencias = {"C1": [], "C2": [], "LINEA CALIENTE": []}
+        advertencia = _formatear_error_usuario("⚠️ No se pudieron leer las diferencias finales del inventario", e)
+
+    historial_previo = _leer_historial_cierre(fecha) or {}
+    metadata_historial = dict(historial_previo.get("metadata") or {})
+    metadata_historial["origen"] = "ajuste_registros"
+    if ventas_actuales:
+        _guardar_historial_cierre(
+            fecha,
+            ventas_actuales,
+            consumo_agrupado,
+            diferencias,
+            metadata=metadata_historial,
+        )
+
+    lineas = [f"✅ REGISTROS ACTUALIZADOS — {fecha}", "=" * 40]
+    total_ajustes = sum(len(items) for items in actualizados.values())
+    lineas.append(f"\nRegistros corregidos ({total_ajustes}):")
+    for hoja in ("C1", "C2", "LINEA"):
+        items = actualizados.get(hoja, [])
+        if not items:
+            continue
+        hoja_nombre = "LINEA CALIENTE" if hoja == "LINEA" else hoja
+        lineas.append(f"   • {hoja_nombre}: {', '.join(items)}")
+
+    if ventas_actuales:
+        total_ventas = sum(venta.get("cantidad", 0) or 0 for venta in ventas_actuales)
+        lineas.append(
+            f"\nInventario resincronizado con las ventas ya cargadas ({total_ventas} unidades)."
+        )
+    else:
+        lineas.append("\nInventario recalculado solo desde registros.")
+        lineas.append("LINEA CALIENTE sigue pendiente del ticket final.")
+
+    if advertencia:
+        lineas.append("")
+        lineas.append(advertencia)
+    lineas.extend(_formatear_diferencias_inventario(diferencias))
+    lineas.append("")
+    lineas.append(_recordatorio_edicion_manual())
+    return "\n".join(lineas)
+
+
+def preparar_registro_corregido(fecha: str = None, avisos: list[dict] | None = None,
+                                contexto: dict | None = None) -> dict:
+    contexto = _normalizar_contexto(contexto)
+    if not avisos:
+        return {"ok": False, "resumen": "❌ Debes indicar al menos un aviso de registro corregido."}
+
+    if not fecha:
+        fecha = sugerir_fecha()[0]
+
+    try:
+        registros_actuales = leer_registros_dia_completo(fecha)
+        ventas_actuales = leer_ventas_neola_dia(fecha)
+    except Exception as e:
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer datos del día", e)}
+
+    try:
+        confirmados, diferencias_aviso = _verificar_avisos_registros(registros_actuales, avisos)
+    except ValueError as e:
+        return {"ok": False, "resumen": f"❌ {str(e)}"}
+
+    if diferencias_aviso:
+        lineas = [f"❌ Todavía no veo esa corrección en la hoja — {fecha}", "=" * 40]
+        lineas.append("")
+        lineas.append("Revisa la edición manual y vuelve a avisarme cuando ya esté guardada.")
+        lineas.append("")
+        lineas.append("Diferencias detectadas:")
+        lineas.extend(_formatear_diferencias_aviso_registro(diferencias_aviso))
+        return {"ok": False, "resumen": "\n".join(lineas)}
+
+    modo_ventas = "final_ticket" if ventas_actuales else "provisional_registros"
+    total_ventas = sum(venta.get("cantidad", 0) or 0 for venta in ventas_actuales)
+    consumo_agrupado = {}
+    alertas = []
+    if ventas_actuales:
+        try:
+            recetas = leer_recetas()
+            datos = _preparar_datos_cierre(
+                ventas_actuales,
+                fecha,
+                recetas,
+                registros=registros_actuales,
+            )
+            consumo_agrupado = datos["consumo_agrupado"]
+            alertas = datos["alertas"]
+        except Exception as e:
+            return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al recalcular con los registros corregidos", e)}
+
+    lineas = [f"📝 REGISTRO CORREGIDO MANUALMENTE — {fecha}", "=" * 40]
+    lineas.append("")
+    lineas.append("Correcciones confirmadas en la hoja:")
+    lineas.extend(_formatear_confirmaciones_registro(confirmados))
+
+    if ventas_actuales:
+        lineas.append("")
+        lineas.append(
+            f"Después de esto, se resincronizará el inventario usando "
+            f"las ventas ya cargadas ({total_ventas} unidades)."
+        )
+    else:
+        lineas.append("")
+        lineas.append("Todavía no hay ventas cargadas para ese día.")
+        lineas.append("El inventario se volverá a calcular solo desde registros.")
+        lineas.append("LINEA CALIENTE seguirá pendiente del ticket final.")
+
+    if alertas:
+        lineas.append("")
+        lineas.append("⚠️ Alertas:")
+        for alerta in alertas:
+            lineas.append(f"   {alerta}")
+
+    lineas.append("")
+    lineas.append("=" * 40)
+    lineas.append(_mensaje_cuidado_hojas())
+    lineas.append("¿Todo correcto? ¿Releo el día y actualizo el inventario?")
+
+    return {
+        "ok": True,
+        "fecha": fecha,
+        "avisos": avisos,
+        "ventas_actuales": ventas_actuales,
+        "registros_actuales": registros_actuales,
+        "consumo_agrupado": consumo_agrupado,
+        "modo_ventas": modo_ventas,
+        "resumen": "\n".join(lineas),
+    }
+
+
+def confirmar_registro_corregido(preparacion: dict, contexto: dict | None = None,
+                                 on_progress=None) -> str:
+    fecha = preparacion["fecha"]
+    contexto = _normalizar_contexto(contexto)
+    sheets_cache = _ctx_sheets_cache(contexto)
+
+    try:
+        _emitir_progreso(on_progress, "Estoy releyendo los registros corregidos.")
+        registros_actualizados = leer_registros_dia_completo(fecha)
+        ventas_actuales = leer_ventas_neola_dia(fecha)
+        confirmados, diferencias_aviso = _verificar_avisos_registros(
+            registros_actualizados,
+            preparacion["avisos"],
+        )
+    except Exception as e:
+        return _formatear_error_usuario("❌ Error al releer los registros corregidos", e)
+
+    if diferencias_aviso:
+        lineas = [f"❌ La hoja cambió y ya no coincide con el aviso — {fecha}", "=" * 40]
+        lineas.append("")
+        lineas.append("Antes de seguir, revisa otra vez la corrección manual en la hoja.")
+        lineas.append("")
+        lineas.append("Diferencias detectadas:")
+        lineas.extend(_formatear_diferencias_aviso_registro(diferencias_aviso))
+        return "\n".join(lineas)
+
+    modo_ventas = "final_ticket" if ventas_actuales else "provisional_registros"
+    consumo_agrupado = {}
+    try:
+        if ventas_actuales:
+            recetas = leer_recetas()
+            datos = _preparar_datos_cierre(
+                ventas_actuales,
+                fecha,
+                recetas,
+                registros=registros_actualizados,
+            )
+            consumo_agrupado = datos["consumo_agrupado"]
+
+        _emitir_progreso(on_progress, "Estoy actualizando el inventario.")
+        ubicaciones = leer_ubicacion_descuento()
+        escribir_inventario_dia(
+            fecha,
+            consumo_agrupado,
+            registros_actualizados,
+            ubicaciones,
+            modo_ventas=modo_ventas,
+            cache=sheets_cache,
+        )
+    except Exception as e:
+        return _formatear_error_usuario("❌ La corrección manual se leyó, pero falló la actualización del inventario", e)
+
+    try:
+        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
+        advertencia = ""
+    except Exception as e:
+        diferencias = {"C1": [], "C2": [], "LINEA CALIENTE": []}
+        advertencia = _formatear_error_usuario("⚠️ No se pudieron leer las diferencias finales del inventario", e)
+
+    historial_previo = _leer_historial_cierre(fecha) or {}
+    metadata_historial = dict(historial_previo.get("metadata") or {})
+    metadata_historial["origen"] = "registro_corregido_manual"
+    if ventas_actuales:
+        _guardar_historial_cierre(
+            fecha,
+            ventas_actuales,
+            consumo_agrupado,
+            diferencias,
+            metadata=metadata_historial,
+        )
+
+    lineas = [f"✅ REGISTRO REVISADO — {fecha}", "=" * 40]
+    lineas.append("")
+    lineas.append("Correcciones confirmadas:")
+    lineas.extend(_formatear_confirmaciones_registro(confirmados))
+    lineas.append("")
+    if ventas_actuales:
+        total_ventas = sum(venta.get("cantidad", 0) or 0 for venta in ventas_actuales)
+        lineas.append(
+            f"Inventario resincronizado con las ventas ya cargadas ({total_ventas} unidades)."
+        )
+    else:
+        lineas.append("Inventario recalculado solo desde registros.")
+
+    if advertencia:
+        lineas.append("")
+        lineas.append(advertencia)
+    lineas.extend(_formatear_diferencias_inventario(diferencias))
+    lineas.append("")
+    lineas.append(_recordatorio_edicion_manual())
+    return "\n".join(lineas)
 
 
 # ============================================================
 # Opción 2: Inventario solo desde registros (sin ticket)
 # ============================================================
 
-def preparar_inventario_registros(fecha: str = None) -> dict:
+def preparar_inventario_registros(fecha: str = None, contexto: dict | None = None) -> dict:
     """
     Preview de inventario usando solo registros del día. Sin foto de ticket.
     No escribe nada en Sheets.
     """
+    contexto = _normalizar_contexto(contexto)
     if not fecha:
         fecha = sugerir_fecha()[0]
 
     try:
-        registros = leer_registros_dia_completo(fecha)
+        registros = _ctx_get_registros(contexto, fecha)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer registros: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer registros", e)}
 
     total_movimientos = sum(len(r) for r in registros.values())
     if total_movimientos == 0:
@@ -1324,9 +2211,9 @@ def preparar_inventario_registros(fecha: str = None) -> dict:
         }
 
     try:
-        ubicaciones = leer_ubicacion_descuento()
+        ubicaciones = _ctx_get_ubicaciones(contexto)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer ubicaciones: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer ubicaciones", e)}
 
     lineas = [f"📋 INVENTARIO DESDE REGISTROS — {fecha}"]
     lineas.append("=" * 40)
@@ -1352,6 +2239,7 @@ def preparar_inventario_registros(fecha: str = None) -> dict:
     lineas.append(f"Se crearán las entradas del {fecha} en C1, C2 y LINEA CALIENTE.")
     lineas.append("En C1 y C2, VENTAS provisional se llenará desde SALIDA registrada.")
     lineas.append("LINEA CALIENTE quedará pendiente del ticket para completar VENTAS.")
+    lineas.append(_mensaje_cuidado_hojas())
     lineas.append("\n¿Todo correcto? ¿Procedo?")
 
     return {
@@ -1363,33 +2251,45 @@ def preparar_inventario_registros(fecha: str = None) -> dict:
     }
 
 
-def confirmar_inventario_registros(preparacion: dict) -> str:
+def confirmar_inventario_registros(preparacion: dict, contexto: dict | None = None,
+                                   on_progress=None) -> str:
     """Escribe el inventario del día usando solo registros con ventas provisionales."""
     fecha = preparacion["fecha"]
     registros = preparacion["registros"]
     ubicaciones = preparacion["ubicaciones"]
+    contexto = _normalizar_contexto(contexto)
+    sheets_cache = _ctx_sheets_cache(contexto)
 
     try:
+        _emitir_progreso(on_progress, "Estoy creando las entradas del día con los registros.")
         escribir_inventario_dia(
             fecha,
             {},
             registros,
             ubicaciones,
             modo_ventas="provisional_registros",
+            cache=sheets_cache,
         )
     except Exception as e:
-        return f"❌ Error al escribir inventario: {str(e)}"
+        return _formatear_error_usuario("❌ Error al escribir inventario", e)
 
     try:
-        diferencias = leer_diferencias_inventario_dia(fecha)
+        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        diferencias = leer_diferencias_inventario_dia(fecha, cache=sheets_cache)
+        advertencia_diferencias = ""
     except Exception as e:
         diferencias = {"C1": [], "C2": [], "LINEA CALIENTE": []}
+        advertencia_diferencias = _formatear_error_usuario("⚠️ No se pudieron leer las diferencias finales del inventario", e)
 
     lineas = [f"✅ INVENTARIO CREADO — {fecha}"]
     lineas.append("Entradas creadas en C1, C2 y LINEA CALIENTE.")
     lineas.append("C1 y C2 quedaron con VENTAS provisional desde SALIDA registrada.")
     lineas.append("LINEA CALIENTE sigue pendiente del ticket para completar VENTAS.")
+    if advertencia_diferencias:
+        lineas.append(advertencia_diferencias)
     lineas.extend(_formatear_diferencias_inventario(diferencias))
+    lineas.append("")
+    lineas.append(_recordatorio_edicion_manual())
     return "\n".join(lineas)
 
 
@@ -1400,19 +2300,21 @@ def confirmar_inventario_registros(preparacion: dict) -> str:
 def preparar_solo_ventas(image_path: str = None, image_bytes: bytes = None,
                          media_type: str = "image/jpeg", fecha: str = None,
                          rollitos_override: dict | None = None,
-                         precierre: bool = False) -> dict:
+                         precierre: bool = False,
+                         contexto: dict | None = None) -> dict:
     """
     Preview de ventas para cargar a una entrada de inventario ya existente.
     Requiere que la entrada del día ya exista (creada con solo-registros).
     """
+    contexto = _normalizar_contexto(contexto)
     if not fecha:
         fecha = sugerir_fecha()[0]
 
     # Verificar que la entrada del día existe
     try:
-        existencia = verificar_inventario_dia_existe(fecha)
+        existencia = _ctx_get_existencia_inventario(contexto, fecha)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al verificar inventario: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al verificar inventario", e)}
 
     hojas_faltantes = [hoja for hoja, existe in existencia.items() if not existe]
     if hojas_faltantes:
@@ -1432,14 +2334,15 @@ def preparar_solo_ventas(image_path: str = None, image_bytes: bytes = None,
         fecha=fecha,
         rollitos_override=rollitos_override,
         precierre=precierre,
+        contexto=contexto,
     )
     if not prep["ok"]:
         return prep
 
     try:
-        recetas = leer_recetas()
+        recetas = _ctx_get_recetas(contexto)
     except Exception as e:
-        return {"ok": False, "resumen": f"❌ Error al leer recetas: {str(e)}"}
+        return {"ok": False, "resumen": _formatear_error_usuario("❌ Error al leer recetas", e)}
 
     actualizacion = _preparar_actualizacion_ventas(
         fecha=fecha,
@@ -1452,6 +2355,7 @@ def preparar_solo_ventas(image_path: str = None, image_bytes: bytes = None,
         origen="solo_ventas",
         descripcion="Cargar ventas",
         precierre=precierre,
+        contexto=contexto,
     )
     if actualizacion.get("ok"):
         lineas = actualizacion["resumen"].splitlines()
@@ -1463,12 +2367,14 @@ def preparar_solo_ventas(image_path: str = None, image_bytes: bytes = None,
 
 
 def confirmar_solo_ventas(preparacion: dict, image_path: str = None,
-                          image_bytes: bytes = None) -> str:
+                          image_bytes: bytes = None,
+                          on_progress=None) -> str:
     """Carga las ventas del ticket a una entrada de inventario ya existente."""
     return _confirmar_actualizacion_ventas(
         preparacion,
         image_path=image_path,
         image_bytes=image_bytes,
+        on_progress=on_progress,
     )
 
 
@@ -1479,12 +2385,16 @@ def confirmar_solo_ventas(preparacion: dict, image_path: str = None,
 def ejecutar_cierre(image_path: str = None, image_bytes: bytes = None,
                      media_type: str = "image/jpeg", fecha: str = None,
                      rollitos_override: dict | None = None,
-                     precierre: bool = False) -> str:
+                     precierre: bool = False,
+                     on_progress=None) -> str:
     """Cierre completo sin confirmación (para terminal/testing)."""
+    contexto = {}
+    _emitir_progreso(on_progress, "Estoy revisando la imagen del ticket.")
     prep = preparar_cierre(image_path=image_path, image_bytes=image_bytes,
                             media_type=media_type, fecha=fecha,
                             rollitos_override=rollitos_override,
-                            precierre=precierre)
+                            precierre=precierre,
+                            contexto=contexto)
     if not prep["ok"]:
         return prep["resumen"]
     return confirmar_cierre(
@@ -1492,42 +2402,51 @@ def ejecutar_cierre(image_path: str = None, image_bytes: bytes = None,
         image_path=image_path,
         image_bytes=image_bytes,
         rollitos_override=rollitos_override,
+        contexto=contexto,
+        on_progress=on_progress,
     )
 
 
 def corregir_inventario_por_insumos(image_path: str = None, image_bytes: bytes = None,
                                     media_type: str = "image/jpeg", fecha: str = None,
                                     insumos: list[str] | None = None,
-                                    rollitos_override: dict | None = None) -> str:
+                                    rollitos_override: dict | None = None,
+                                    on_progress=None) -> str:
     if not insumos:
         return "❌ Debes indicar al menos un insumo para corregir."
 
+    contexto = {}
     if not fecha:
         fecha = sugerir_fecha()[0]
 
+    _emitir_progreso(on_progress, "Estoy revisando la imagen del ticket.")
     prep = preparar_cierre(
         image_path=image_path,
         image_bytes=image_bytes,
         media_type=media_type,
         fecha=fecha,
         rollitos_override=rollitos_override,
+        contexto=contexto,
     )
     if not prep["ok"]:
         return prep["resumen"]
 
     try:
-        registros = leer_registros_dia_completo(fecha)
-        ubicaciones = leer_ubicacion_descuento()
+        registros = _ctx_get_registros(contexto, fecha)
+        ubicaciones = _ctx_get_ubicaciones(contexto)
+        _emitir_progreso(on_progress, "Estoy corrigiendo los insumos indicados.")
         actualizados = corregir_inventario_insumos(
             fecha,
             insumos,
             prep["consumo_agrupado"],
             registros,
             ubicaciones,
+            cache=_ctx_sheets_cache(contexto),
         )
-        diferencias = leer_diferencias_inventario_dia(fecha)
+        _emitir_progreso(on_progress, "Estoy revisando si quedó alguna diferencia.")
+        diferencias = leer_diferencias_inventario_dia(fecha, cache=_ctx_sheets_cache(contexto))
     except Exception as e:
-        return f"❌ Error al corregir inventario puntual: {str(e)}"
+        return _formatear_error_usuario("❌ Error al corregir inventario puntual", e)
 
     lineas = [f"🛠️ CORRECCIÓN PUNTUAL DE INVENTARIO — {fecha}"]
     for hoja in ("C1", "C2", "LINEA CALIENTE"):
@@ -1542,16 +2461,24 @@ def corregir_inventario_por_insumos(image_path: str = None, image_bytes: bytes =
 def solo_parsear_ticket(image_path: str = None, image_bytes: bytes = None,
                          media_type: str = "image/jpeg") -> str:
     try:
-        if image_bytes:
-            ventas = parsear_foto_bytes(image_bytes, media_type)
-        elif image_path:
-            ventas = parsear_foto_ticket(image_path)
-        else:
-            return "❌ No se recibió imagen"
+        ventas, diagnostico_lectura = _parsear_ticket_desde_imagen(
+            image_path=image_path,
+            image_bytes=image_bytes,
+            media_type=media_type,
+        )
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return _formatear_error_usuario("❌ Error al leer el ticket", e)
 
-    lineas = [f"🔍 Platos detectados ({sum(v['cantidad'] for v in ventas)} unidades):\n"]
+    lineas = []
+    alertas_lectura = _alertas_lectura_para_cliente(diagnostico_lectura)
+    if alertas_lectura:
+        for alerta in alertas_lectura:
+            lineas.append(alerta)
+        for sugerencia in _sugerencias_lectura_para_cliente(diagnostico_lectura):
+            lineas.append(sugerencia)
+        lineas.append("")
+
+    lineas.append(f"🔍 Platos detectados ({sum(v['cantidad'] for v in ventas)} unidades):\n")
     for v in ventas:
         lineas.append(f"   • {v['plato']} x{v['cantidad']} — ${v['precio_total']:.2f}")
     lineas.append(f"\nTotal: ${sum(v['precio_total'] for v in ventas):.2f}")
@@ -1561,27 +2488,28 @@ def solo_parsear_ticket(image_path: str = None, image_bytes: bytes = None,
 def solo_consumo_teorico(image_path: str = None, image_bytes: bytes = None,
                           media_type: str = "image/jpeg", fecha: str = None,
                           rollitos_override: dict | None = None,
-                          usar_registros_rollitos: bool = False) -> str:
+                          usar_registros_rollitos: bool = False,
+                          contexto: dict | None = None) -> str:
+    contexto = _normalizar_contexto(contexto)
     try:
-        if image_bytes:
-            ventas = parsear_foto_bytes(image_bytes, media_type)
-        elif image_path:
-            ventas = parsear_foto_ticket(image_path)
-        else:
-            return "❌ No se recibió imagen"
+        ventas, diagnostico_lectura = _parsear_ticket_desde_imagen(
+            image_path=image_path,
+            image_bytes=image_bytes,
+            media_type=media_type,
+        )
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        return _formatear_error_usuario("❌ Error al leer el ticket", e)
 
     try:
-        recetas = leer_recetas()
+        recetas = _ctx_get_recetas(contexto)
     except Exception as e:
-        return f"❌ Error al leer recetas: {str(e)}"
+        return _formatear_error_usuario("❌ Error al leer recetas", e)
 
     fecha_base = fecha or sugerir_fecha()[0]
     registros = None
     if usar_registros_rollitos and _cantidad_rollitos_ambiguos(ventas) and not rollitos_override:
         try:
-            registros = leer_registros_dia_completo(fecha_base)
+            registros = _ctx_get_registros(contexto, fecha_base)
         except Exception:
             registros = None
 
@@ -1595,7 +2523,7 @@ def solo_consumo_teorico(image_path: str = None, image_bytes: bytes = None,
     )
     consumo = datos["consumo"]
     agrupado = datos["consumo_agrupado"]
-    alertas = datos["alertas"]
+    alertas = _alertas_lectura_para_cliente(diagnostico_lectura) + datos["alertas"]
     ventas = datos["ventas"]
 
     lineas = [f"📦 CONSUMO TEÓRICO DE INSUMOS"]
@@ -1614,5 +2542,10 @@ def solo_consumo_teorico(image_path: str = None, image_bytes: bytes = None,
     if _cantidad_rollitos_ambiguos(ventas):
         lineas.append("\n❓ Tipo de rollitos vendidos por confirmar.")
         lineas.append("¿Cuántos fueron de pollo y cuántos de queso?")
+
+    sugerencias_lectura = _sugerencias_lectura_para_cliente(diagnostico_lectura)
+    if sugerencias_lectura:
+        lineas.append("")
+        lineas.extend(sugerencias_lectura)
 
     return "\n".join(lineas)
